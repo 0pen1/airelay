@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>airelay</title>
+  <link rel="stylesheet" href="/node_modules/@xterm/xterm/css/xterm.css" />
+  <style>
+    :root {
+      --color-bg: #f8f8f7;
+      --color-surface: #ffffff;
+      --color-border: #e2e0dc;
+      --color-text: #1a1917;
+      --color-text-muted: #6b6860;
+      --color-accent: oklch(55% 0.18 255);
+      --color-accent-hover: oklch(48% 0.18 255);
+      --color-danger: oklch(50% 0.20 25);
+      --color-success: oklch(50% 0.15 145);
+      --radius-sm: 6px;
+      --radius-md: 10px;
+      --radius-lg: 16px;
+      --space-1: 4px;
+      --space-2: 8px;
+      --space-3: 12px;
+      --space-4: 16px;
+      --space-6: 24px;
+      --space-8: 32px;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --color-bg: #141413;
+        --color-surface: #1e1e1c;
+        --color-border: #2e2e2b;
+        --color-text: #f0ede8;
+        --color-text-muted: #888680;
+        --color-accent: oklch(65% 0.16 255);
+        --color-accent-hover: oklch(70% 0.16 255);
+      }
+    }
+
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    html, body {
+      height: 100%;
+      font-family: system-ui, -apple-system, sans-serif;
+      font-size: 15px;
+      line-height: 1.5;
+      background: var(--color-bg);
+      color: var(--color-text);
+      -webkit-text-size-adjust: 100%;
+    }
+
+    #app {
+      height: 100%;
+      display: flex;
+      flex-direction: column;
+    }
+  </style>
+</head>
+<body>
+  <div id="app"></div>
+  <script type="module" src="/src/main.ts"></script>
+</body>
+</html>
