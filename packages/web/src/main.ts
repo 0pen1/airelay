@@ -53,6 +53,16 @@ function route(): void {
   if (rawHash.startsWith('/terminal/')) {
     const sessionId = rawHash.slice('/terminal/'.length);
     if (!sessionId) { location.hash = '#/sessions'; return; }
+    // The terminal page sends input/resize/detach over the shared WS. If we
+    // landed here directly (e.g. a refresh after a relay restart, or a
+    // deep-link) the WS may never have been opened — wsManager.connect is
+    // only called on the #/sessions and login routes. Without this, every
+    // sendInput silently no-ops (ws not OPEN) and keystrokes/Enter never
+    // reach the agent, even though arrow keys appeared to work earlier (they
+    // were only working while a prior connection happened to still be live).
+    if (!wsManager.connected && sessionToken && relayUrl) {
+      wsManager.connect(relayUrl, sessionToken);
+    }
     currentCleanup = mountTerminal(app, sessionId);
     return;
   }

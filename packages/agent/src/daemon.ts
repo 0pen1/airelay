@@ -9,6 +9,7 @@ import type {
 } from '@airelay/shared';
 import { SessionManager } from './sessions.js';
 import { PtyDriver } from './drivers/pty-driver.js';
+import type { Disposable } from './drivers/types.js';
 import { exec as execCb } from 'node:child_process';
 import { promisify } from 'node:util';
 
@@ -70,6 +71,20 @@ function log(msg: string): void {
 export function startDaemon(): void {
   const config = loadConfig();
   const sessionManager = new SessionManager();
+
+  // Active output/exit subscriptions per session, so we can dispose them on
+  // detach/disconnect. Without this, a re-attach (e.g. after daemon restart,
+  // or clicking a session from the list) would find no live callback to
+  // forward tmux output to the client — the terminal would freeze.
+  const subs = new Map<string, Disposable[]>();
+
+  function disposeSubs(sessionId: string): void {
+    const list = subs.get(sessionId);
+    if (list) {
+      for (const d of list) d.dispose();
+      subs.delete(sessionId);
+    }
+  }
 
   // Register drivers from agents.json
   sessionManager.syncDrivers(buildDriversFromConfig());
@@ -136,7 +151,10 @@ export function startDaemon(): void {
 
     if (type === 'client_disconnected') {
       const sid = msg['session_id'] as string | undefined;
-      if (sid) sessionManager.unlock(sid);
+      if (sid) {
+        sessionManager.unlock(sid);
+        disposeSubs(sid);
+      }
       return;
     }
 
@@ -192,13 +210,7 @@ export function startDaemon(): void {
       try {
         const sessionId = await sessionManager.create(agentId);
         send({ type: 'session_created', session_id: sessionId, agent_id: agentId });
-        // Wire up output forwarding
-        driver.onOutput(sessionId, (data) => send({ type: 'output', session_id: sessionId, data }));
-        driver.onExit(sessionId, (code) => {
-          send({ type: 'session_exited', session_id: sessionId, code });
-          sessionManager.remove(sessionId).catch(() => {});
-        });
-        // Auto-attach
+        // Auto-attach (doAttach wires up output/exit forwarding)
         await doAttach(sessionId, 'auto');
       } catch (err) {
         send({ type: 'error', code: 'AGENT_UNAVAILABLE' as ErrorCode, message: String(err) });
@@ -241,6 +253,7 @@ export function startDaemon(): void {
       const sessionId = msg['session_id'] as string | undefined;
       if (!sessionId || !validateSessionId(sessionId)) return;
       sessionManager.unlock(sessionId);
+      disposeSubs(sessionId);
       return;
     }
   }
@@ -257,6 +270,27 @@ export function startDaemon(): void {
     }
     if (_source === 'explicit') sessionManager.lock(sessionId, 'client');
     send({ type: 'attached', session_id: sessionId });
+
+    // (Re)wire output/exit forwarding for this session. disposeSubs first so
+    // a re-attach doesn't stack duplicate callbacks. This is what makes a
+    // session clicked from the list (or restored after a daemon restart)
+    // actually stream live output — new_session never registered callbacks
+    // for restored sessions, and the original ones died with the old process.
+    disposeSubs(sessionId);
+    const list: Disposable[] = [];
+    list.push(
+      session.driver.onOutput(sessionId, (data) =>
+        send({ type: 'output', session_id: sessionId, data }),
+      ),
+    );
+    list.push(
+      session.driver.onExit(sessionId, (code) => {
+        send({ type: 'session_exited', session_id: sessionId, code });
+        disposeSubs(sessionId);
+        sessionManager.remove(sessionId).catch(() => {});
+      }),
+    );
+    subs.set(sessionId, list);
 
     // Send scrollback in 64 KB chunks
     try {

@@ -23,6 +23,7 @@ export function mountTerminal(app: HTMLElement, sessionId: string): () => void {
       <div class="term-container" id="term-container" role="main" aria-label="Terminal"></div>
 
       <div class="term-toolbar" role="toolbar" aria-label="Special keys">
+        <button class="key-btn" data-send="\r" aria-label="Enter">⏎</button>
         <button class="key-btn" data-send="\x03" aria-label="Control C">^C</button>
         <button class="key-btn" data-send="\x04" aria-label="Control D">^D</button>
         <button class="key-btn" data-send="\t"   aria-label="Tab">Tab</button>
