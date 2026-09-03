@@ -213,6 +213,15 @@ export function mountSessions(app: HTMLElement): () => void {
 
   wsManager.setStatusCallback(updateStatus);
 
+  let receivedList = false;
+  // Safety net: if we're connected but never received a sessions_list (e.g. the
+  // WS authed but the relay/agent dropped the list_sessions request during a
+  // brief reconnect glitch), re-request once after a short delay. Without this
+  // the page can sit on the skeleton placeholders forever after a refresh.
+  const retryTimer = setTimeout(() => {
+    if (!receivedList) requestSessions();
+  }, 1500);
+
   function renderSessions(): void {
     sessionsList.innerHTML = '';
     if (sessions.length === 0) {
@@ -298,6 +307,7 @@ export function mountSessions(app: HTMLElement): () => void {
 
   const off = wsManager.on((msg) => {
     if (msg['type'] === 'sessions_list') {
+      receivedList = true;
       sessions = msg['sessions'] as SessionInfo[];
       renderSessions();
     } else if (msg['type'] === 'agent_types') {
@@ -311,6 +321,7 @@ export function mountSessions(app: HTMLElement): () => void {
 
   return () => {
     off();
+    clearTimeout(retryTimer);
     // Drop our status callback so a later (re)connect doesn't fire
     // requestSessions against a stale DOM after we've unmounted.
     wsManager.setStatusCallback(() => {});
