@@ -113,6 +113,11 @@ export enum ErrorCode {
   SESSION_NOT_FOUND = 'SESSION_NOT_FOUND',
   AGENT_NOT_FOUND = 'AGENT_NOT_FOUND',
   AGENT_UNAVAILABLE = 'AGENT_UNAVAILABLE',
+  // Relay-side: the client's access token (session_token or JWT) was rejected
+  // (expired / invalid / revoked). The relay closes the WS with 4001 right
+  // after sending this; the web client keys off the 4001 close code to stop
+  // its reconnect loop and prompt a re-scan.
+  AUTH_FAILED = 'AUTH_FAILED',
 }
 
 export interface ErrorMsg {

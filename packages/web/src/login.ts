@@ -1,4 +1,5 @@
 import { wsManager } from './ws.js';
+import { parseTokenString, addHostAndConnect } from './hosts.js';
 
 export function mountLogin(app: HTMLElement): () => void {
   app.innerHTML = `
@@ -113,23 +114,39 @@ export function mountLogin(app: HTMLElement): () => void {
   }
 
   const off = wsManager.on((msg) => {
-    if (msg['type'] === 'session_token_issued') {
-      location.hash = '#/sessions';
-    } else if (msg['type'] === 'error') {
+    // session_token_issued is captured centrally (main.ts writes it into the
+    // host entry); login only needs to surface errors here.
+    if (msg['type'] === 'error') {
       showError((msg['message'] as string) ?? 'Connection error');
     }
-  });
-
-  wsManager.setStatusCallback((connected, _reconnecting) => {
-    if (connected) location.hash = '#/sessions';
   });
 
   form.addEventListener('submit', (e) => {
     e.preventDefault();
     errorDiv.hidden = true;
     const relayUrl = (app.querySelector('#relay-url') as HTMLInputElement).value.trim();
-    const token = (app.querySelector('#token-input') as HTMLInputElement).value.trim();
-    wsManager.connect(relayUrl, token);
+    const tokenInput = (app.querySelector('#token-input') as HTMLInputElement).value.trim();
+
+    // The token may be a full QR payload (carries its own url) OR a bare JWT
+    // (needs the relay-url field). Parse it to recover host_id (required to
+    // build a HostEntry). Opaque session_tokens are rejected — they're for
+    // reconnect, not provisioning; re-scan the QR instead.
+    const parsed = parseTokenString(tokenInput, relayUrl || undefined);
+    if (!parsed) {
+      showError('无法识别该 token。请扫码，或粘贴 JWT / 二维码内容。（不透明的 session_token 不能用于添加主机，请重扫二维码）');
+      return;
+    }
+    if (!parsed.relay_url) {
+      showError('该 token 不含 Relay URL，请填写 Relay URL');
+      return;
+    }
+    // addHostAndConnect writes the entry (placeholder JWT) + connects. The
+    // central session_token_issued handler captures the real token; on authed
+    // we jump to that host's sessions.
+    const hostId = addHostAndConnect(parsed.host_id, parsed.relay_url, parsed.token);
+    wsManager.setStatusCallback((connected) => {
+      if (connected) location.hash = `#/hosts/${hostId}/sessions`;
+    });
   });
 
   return () => { off(); };

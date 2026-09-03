@@ -2,6 +2,11 @@ import { wsManager } from './ws.js';
 import { mountLogin } from './login.js';
 import { mountSessions } from './sessions.js';
 import { mountTerminal } from './terminal.js';
+import { mountHosts } from './hostsView.js';
+import {
+  listHosts, getHost, getActiveHostId, setActiveHostId,
+  updateSessionToken, getActiveHost, hostScopedHash, parseTokenString, addHostAndConnect,
+} from './hosts.js';
 
 const app = document.getElementById('app')!;
 let currentCleanup: (() => void) | null = null;
@@ -14,85 +19,128 @@ function unmount(): void {
   app.innerHTML = '';
 }
 
+// ── ensureHostConnected ─────────────────────────────────────────────────────
+// The single funnel for "make the WS talk to this host". Because only one host
+// is connected at a time, switching = connect() to the other host's stored
+// (relay_url, session_token). wsManager.connect() clears any pending reconnect
+// from the old socket and closes it, so this is safe to call on every route.
+//
+// Returns true if the requested host is already connected+authed (the caller
+// can mount its view immediately); false if a (re)connect was initiated (the
+// view's status callback handles authed → list re-request, exactly as the old
+// ad-hoc connect blocks did).
+function ensureHostConnected(hostId: string): boolean {
+  const entry = getHost(hostId);
+  if (!entry) {
+    // Unknown host — bounce to the hosts list. (e.g. a bookmarked route for a
+    // host that was since removed.)
+    location.hash = '#/hosts';
+    return false;
+  }
+  if (wsManager.connected && getActiveHostId() === hostId) {
+    return true;
+  }
+  setActiveHostId(hostId);
+  wsManager.connect(entry.relay_url, entry.session_token);
+  return false;
+}
+
+// ── routing ─────────────────────────────────────────────────────────────────
 function route(): void {
   const hash = location.hash || '#/';
   unmount();
 
-  const sessionToken = localStorage.getItem('airelay_session_token');
-  const relayUrl = localStorage.getItem('airelay_relay_url');
-
-  // Parse QR-code payload from hash: #/<base64>
-  // The hash may contain a base64url payload from gen-token QR code
   const rawHash = hash.slice(1); // remove leading '#'
-  if (rawHash && !rawHash.startsWith('/')) {
-    // Looks like a base64 payload (no leading slash)
-    try {
-      const decoded = JSON.parse(atob(rawHash.replace(/-/g, '+').replace(/_/g, '/')));
-      if (decoded.url && decoded.host_id && decoded.token) {
-        // Store relay URL, clear old session token, connect immediately
-        localStorage.setItem('airelay_relay_url', decoded.url);
-        localStorage.removeItem('airelay_session_token');
-        history.replaceState(null, '', '/');
-        location.hash = '#/login';
-        // Pre-fill and connect
-        wsManager.connect(decoded.url, decoded.token);
-        wsManager.setStatusCallback((connected) => {
-          if (connected) location.hash = '#/sessions';
-        });
-        wsManager.on((msg) => {
-          if (msg['type'] === 'session_token_issued') {
-            location.hash = '#/sessions';
-          }
-        });
-        currentCleanup = mountLogin(app);
-        return;
-      }
-    } catch { /* not a QR payload, fall through */ }
-  }
 
-  if (rawHash.startsWith('/terminal/')) {
-    const sessionId = rawHash.slice('/terminal/'.length);
-    if (!sessionId) { location.hash = '#/sessions'; return; }
-    // The terminal page sends input/resize/detach over the shared WS. If we
-    // landed here directly (e.g. a refresh after a relay restart, or a
-    // deep-link) the WS may never have been opened — wsManager.connect is
-    // only called on the #/sessions and login routes. Without this, every
-    // sendInput silently no-ops (ws not OPEN) and keystrokes/Enter never
-    // reach the agent, even though arrow keys appeared to work earlier (they
-    // were only working while a prior connection happened to still be live).
-    if (!wsManager.connected && sessionToken && relayUrl) {
-      wsManager.connect(relayUrl, sessionToken);
+  // ── QR-code payload deep-link: #<base64url> (no leading '/') ──────────────
+  if (rawHash && !rawHash.startsWith('/')) {
+    const parsed = parseTokenString(rawHash);
+    if (parsed && parsed.relay_url) {
+      history.replaceState(null, '', '/'); // strip payload from URL bar/history
+      addHostAndConnect(parsed.host_id, parsed.relay_url, parsed.token);
+      // On a successful connect the relay issues a session_token (captured
+      // centrally) and sends {type:'authed'}; the sessions view we land on
+      // requests the list once authed. Navigate there now.
+      wsManager.setStatusCallback((connected) => {
+        if (connected) location.hash = `#/hosts/${parsed.host_id}/sessions`;
+      });
+      currentCleanup = mountSessions(app);
+      return;
     }
-    currentCleanup = mountTerminal(app, sessionId);
+    // Undecodable payload — drop to the hosts list rather than login, since a
+    // user with existing hosts would lose their list by going to login.
+    location.hash = '#/hosts';
     return;
   }
 
-  if (rawHash === '/sessions') {
-    // Auto-reconnect with stored session_token if not already connected
-    if (!wsManager.connected && sessionToken && relayUrl) {
-      wsManager.connect(relayUrl, sessionToken);
-    }
+  // ── Host-scoped routes ────────────────────────────────────────────────────
+  if (rawHash === '/hosts') {
+    currentCleanup = mountHosts(app);
+    return;
+  }
+
+  const sessionsMatch = rawHash.match(/^\/hosts\/([^/]+)\/sessions$/);
+  if (sessionsMatch) {
+    const hostId = sessionsMatch[1];
+    ensureHostConnected(hostId);
     currentCleanup = mountSessions(app);
     return;
   }
 
-  // Default: login
-  // If we have a session_token, try to reconnect silently
-  if (sessionToken && relayUrl && !wsManager.connected) {
-    wsManager.connect(relayUrl, sessionToken);
-    wsManager.setStatusCallback((connected) => {
-      if (connected) location.hash = '#/sessions';
-    });
+  const terminalMatch = rawHash.match(/^\/hosts\/([^/]+)\/terminal\/(.+)$/);
+  if (terminalMatch) {
+    const hostId = terminalMatch[1];
+    const sessionId = terminalMatch[2];
+    ensureHostConnected(hostId);
+    currentCleanup = mountTerminal(app, sessionId);
+    return;
   }
+
+  // ── Backward-compat redirects (old bookmarks / QR scans already in the wild)
+  if (rawHash === '/sessions') {
+    const active = getActiveHostId();
+    location.hash = active ? `#/hosts/${active}/sessions` : '#/hosts';
+    return;
+  }
+  if (rawHash.startsWith('/terminal/')) {
+    const sid = rawHash.slice('/terminal/'.length);
+    const active = getActiveHostId();
+    location.hash = active ? `#/hosts/${active}/terminal/${sid}` : '#/hosts';
+    return;
+  }
+
+  // ── Default (#/, #/login, empty) ─────────────────────────────────────────
+  // If we have an active host with a stored token, go straight to its sessions
+  // (covers refresh on the root path). Otherwise land on the hosts list (which
+  // shows the empty state + add affordance when there are no hosts).
+  const active = getActiveHost();
+  if (active) {
+    location.hash = `#/hosts/${active.host_id}/sessions`;
+    return;
+  }
+  // No hosts at all → login (paste/scan to add the first host).
   currentCleanup = mountLogin(app);
 }
 
-// Persist relay URL whenever we connect successfully
+// ── Central session_token_issued capture ─────────────────────────────────────
+// Single handler that mirrors the relay-issued session_token into the active
+// host entry. ws.ts already persists it to the global airelay_session_token
+// (the write-through mirror / migration source); here we also update the
+// per-host store so the entry is reusable for future reconnects/switches.
+// This must be the ONE place capture happens — do not scatter it across the
+// mount* functions.
 wsManager.on((msg) => {
-  if (msg['type'] === 'session_token_issued') {
-    // session_token already persisted by ws.ts; store nothing extra here
+  if (msg['type'] === 'session_token_issued' && typeof msg['session_token'] === 'string') {
+    const activeId = getActiveHostId();
+    if (activeId) {
+      updateSessionToken(activeId, msg['session_token'] as string);
+    }
   }
 });
+
+// Trigger lazy migration (forced re-scan of legacy single-host users) before
+// the first route resolves, by touching the store.
+listHosts();
 
 window.addEventListener('hashchange', route);
 route();

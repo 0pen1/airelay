@@ -2,6 +2,7 @@ import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { WebLinksAddon } from '@xterm/addon-web-links';
 import { wsManager } from './ws.js';
+import { hostScopedHash } from './hosts.js';
 import { VoiceInput } from './voice.js';
 
 export function mountTerminal(app: HTMLElement, sessionId: string): () => void {
@@ -236,12 +237,12 @@ export function mountTerminal(app: HTMLElement, sessionId: string): () => void {
   // ── navigation ────────────────────────────────────────────────────────────
   backBtn.addEventListener('click', () => {
     wsManager.send({ type: 'detach', session_id: sessionId });
-    location.hash = '#/sessions';
+    location.hash = hostScopedHash('/sessions');
   });
 
   disconnectBtn.addEventListener('click', () => {
     wsManager.send({ type: 'detach', session_id: sessionId });
-    location.hash = '#/sessions';
+    location.hash = hostScopedHash('/sessions');
   });
 
   // ── message handler ───────────────────────────────────────────────────────

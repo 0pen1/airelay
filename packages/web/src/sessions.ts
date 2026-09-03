@@ -1,4 +1,5 @@
 import { wsManager } from './ws.js';
+import { hostScopedHash } from './hosts.js';
 
 interface AgentTypeInfo {
   id: string;
@@ -247,7 +248,7 @@ export function mountSessions(app: HTMLElement): () => void {
       if (!occupied) {
         card.addEventListener('click', () => {
           wsManager.send({ type: 'attach', session_id: s.session_id });
-          location.hash = `#/terminal/${s.session_id}`;
+          location.hash = hostScopedHash(`/terminal/${s.session_id}`);
         });
         card.addEventListener('keydown', (e) => {
           if (e.key === 'Enter' || e.key === ' ') card.click();
@@ -315,7 +316,7 @@ export function mountSessions(app: HTMLElement): () => void {
       renderAgentTypes();
     } else if (msg['type'] === 'session_created') {
       const sid = msg['session_id'] as string;
-      location.hash = `#/terminal/${sid}`;
+      location.hash = hostScopedHash(`/terminal/${sid}`);
     }
   });
 

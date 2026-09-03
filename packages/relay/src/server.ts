@@ -116,10 +116,12 @@ export function createRelayServer(port: number): void {
           try {
             msg = JSON.parse(data.toString());
           } catch {
+            sendJson(ws, { type: 'error', code: 'AUTH_FAILED', message: 'Bad auth message' });
             ws.close(4001, 'Bad auth message');
             return;
           }
           if (msg['type'] !== 'auth' || typeof msg['token'] !== 'string') {
+            sendJson(ws, { type: 'error', code: 'AUTH_FAILED', message: 'Expected auth message' });
             ws.close(4001, 'Expected auth message');
             return;
           }
@@ -135,6 +137,11 @@ export function createRelayServer(port: number): void {
               token, getHost, hasJti, addJti, createSessionToken,
             );
             if (!jwtResult) {
+              // Send an explicit AUTH_FAILED before the 4001 close so the client
+              // can distinguish "token expired/invalid — re-scan" from a
+              // transient disconnect and stop its reconnect loop. (The client
+              // keys off the 4001 close code; this message is for clarity/UI.)
+              sendJson(ws, { type: 'error', code: 'AUTH_FAILED', message: 'Token expired or invalid' });
               ws.close(4001, 'Unauthorized');
               return;
             }
