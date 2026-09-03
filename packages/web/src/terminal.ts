@@ -270,12 +270,29 @@ export function mountTerminal(app: HTMLElement, sessionId: string): () => void {
     }
   });
 
-  // Request session list to get agent name
-  wsManager.send({ type: 'list_sessions' });
+  // Attach to the session so the agent (re)wires output/exit forwarding and
+  // sends us the scrollback. Without this a direct refresh of #/terminal/<sid>
+  // shows a blank terminal — the sessions-list card click sends `attach` for
+  // the normal navigation path, but a reload bypasses that and mountTerminal
+  // never asked to attach, so no scrollback and no live output arrives.
+  //
+  // On a refresh the WS is still reconnecting, so the mount-time send below is
+  // dropped (socket not OPEN); the status callback re-sends once authed.
+  function attachToSession(): void {
+    wsManager.send({ type: 'attach', session_id: sessionId });
+    wsManager.send({ type: 'list_sessions' });
+  }
+  wsManager.setStatusCallback((connected) => {
+    if (connected) attachToSession();
+  });
+  attachToSession();
 
   // ── cleanup ───────────────────────────────────────────────────────────────
   return () => {
     off();
+    // Drop our status callback so a later reconnect doesn't re-attach a
+    // disposed terminal / stale sessionId.
+    wsManager.setStatusCallback(() => {});
     ro.disconnect();
     window.removeEventListener('orientationchange', fitAndSync);
     term.dispose();
