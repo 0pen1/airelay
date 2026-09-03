@@ -153,6 +153,12 @@ export function createRelayServer(port: number): void {
           clearTimeout(authTimeout);
           connId = randomUUID();
           clients.set(connId, { ws, hostId, connId });
+          // Tell the client the connection is now authenticated and ready.
+          // Without this, the client cannot distinguish "socket open" from
+          // "authenticated" — it would fire list_sessions on socket open,
+          // before auth completes, and we'd close the socket (4001) for the
+          // unexpected non-auth message. See server.ts message handler above.
+          sendJson(ws, { type: 'authed' });
           return;
         }
 

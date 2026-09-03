@@ -36,6 +36,38 @@ export class SessionManager {
     return this.drivers.get(agentId);
   }
 
+  /**
+   * Reconcile the driver registry against a fresh config snapshot.
+   *
+   * Drivers are stateless shells over tmux sessions (PtyDriver holds only
+   * command/args + callback sets keyed by sessionId), so replacing one is
+   * safe and does not disturb any live session it is driving. We therefore:
+   *   - keep drivers whose agentId still exists in the config (untouched),
+   *   - drop drivers whose agentId was removed from the config,
+   *   - register drivers for agentIds that newly appeared.
+   * Active sessions keep working because the session→driver link is held by
+   * the `sessions` map, not re-resolved from `drivers` on each request.
+   */
+  syncDrivers(fresh: AgentDriver[]): { added: string[]; removed: string[] } {
+    const next = new Map<string, AgentDriver>();
+    for (const driver of fresh) {
+      // Preserve an existing instance when the agentId is unchanged, so any
+      // outstanding output/exit callbacks on live sessions stay attached.
+      const existing = this.drivers.get(driver.agentId);
+      next.set(driver.agentId, existing ?? driver);
+    }
+    const added: string[] = [];
+    for (const driver of fresh) {
+      if (!this.drivers.has(driver.agentId)) added.push(driver.agentId);
+    }
+    const removed: string[] = [];
+    for (const id of this.drivers.keys()) {
+      if (!next.has(id)) removed.push(id);
+    }
+    this.drivers = next;
+    return { added, removed };
+  }
+
   /** Restore sessions surviving an agent restart by scanning tmux. */
   async restore(): Promise<void> {
     let raw: string;

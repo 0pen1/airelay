@@ -37,10 +37,13 @@ export class WSManager {
     this.ws = ws;
 
     ws.onopen = () => {
-      // Send token as first message for auth
+      // Send token as first message for auth. Do NOT signal "connected" yet —
+      // the socket is open but the relay has not verified the token. We flip
+      // to connected only on receiving {type:'authed'} (see onmessage), so
+      // that any request fired on connect (e.g. list_sessions) lands after
+      // auth completes instead of being rejected/closing the socket.
       ws.send(JSON.stringify({ type: 'auth', token: this.token }));
       this.reconnectDelay = 1000;
-      this.onStatusChange(true, false);
     };
 
     ws.onmessage = (ev) => {
@@ -55,6 +58,12 @@ export class WSManager {
       if (msg['type'] === 'session_token_issued' && typeof msg['session_token'] === 'string') {
         localStorage.setItem('airelay_session_token', msg['session_token'] as string);
         this.token = msg['session_token'] as string;
+      }
+
+      // Relay confirms auth is complete — now the connection is truly usable.
+      if (msg['type'] === 'authed') {
+        this.onStatusChange(true, false);
+        return;
       }
 
       for (const h of this.handlers) h(msg);

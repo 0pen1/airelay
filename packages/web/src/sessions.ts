@@ -200,6 +200,15 @@ export function mountSessions(app: HTMLElement): () => void {
       'conn-status--disconnected'
     );
     connStatus.lastChild!.textContent = connected ? 'Connected' : reconnecting ? 'Reconnecting…' : 'Disconnected';
+    // When the socket (re)connects, re-request the session list. Without this,
+    // a refresh on #/sessions races the async reconnect: mountSessions fires
+    // list_sessions before the socket is OPEN, ws.send() silently drops it,
+    // and the list stays empty forever.
+    if (connected) requestSessions();
+  }
+
+  function requestSessions(): void {
+    wsManager.send({ type: 'list_sessions' });
   }
 
   wsManager.setStatusCallback(updateStatus);
@@ -283,8 +292,9 @@ export function mountSessions(app: HTMLElement): () => void {
   fabBtn.addEventListener('click', openSheet);
   sheetBackdrop.addEventListener('click', closeSheet);
 
-  // Request data on mount
-  wsManager.send({ type: 'list_sessions' });
+  // Request data on mount (covers the already-connected case; the reconnect
+  // case is handled by updateStatus above).
+  requestSessions();
 
   const off = wsManager.on((msg) => {
     if (msg['type'] === 'sessions_list') {
@@ -299,5 +309,10 @@ export function mountSessions(app: HTMLElement): () => void {
     }
   });
 
-  return () => { off(); };
+  return () => {
+    off();
+    // Drop our status callback so a later (re)connect doesn't fire
+    // requestSessions against a stale DOM after we've unmounted.
+    wsManager.setStatusCallback(() => {});
+  };
 }

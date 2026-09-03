@@ -9,6 +9,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { signJwt } from '@airelay/shared';
 import { startDaemon } from './daemon.js';
 import { install, uninstall, isRunning } from './launchd.js';
+import { execSync } from 'node:child_process';
 import * as qrcode from 'qrcode-terminal';
 
 const CONFIG_DIR = join(homedir(), '.config', 'airelay');
@@ -99,9 +100,34 @@ agent
   .command('reload')
   .description('Reload agents.json config (no restart needed)')
   .action(() => {
-    // The daemon re-reads agents.json on each list_agent_types request,
-    // so a reload signal is not strictly needed. Print a confirmation.
-    console.log('Config will be picked up on the next client request (no restart needed).');
+    // Find the running daemon process and send it SIGHUP, which triggers an
+    // in-place driver re-sync (see daemon.ts). The daemon matches `agent _run`
+    // in its command line; this pattern excludes the `reload` process itself.
+    let pids: string[] = [];
+    try {
+      const out = execSync("pgrep -f 'agent _run'", { encoding: 'utf8' });
+      pids = out.split('\n').map((s) => s.trim()).filter(Boolean);
+    } catch {
+      // pgrep exits non-zero when nothing matches → no daemon running
+    }
+
+    if (pids.length === 0) {
+      console.log('No running agent daemon found.');
+      console.log('Start it with: airelay agent start');
+      return;
+    }
+
+    let signaled = 0;
+    for (const pid of pids) {
+      try {
+        process.kill(Number(pid), 'SIGHUP');
+        signaled++;
+      } catch {
+        // process may have exited between pgrep and kill — skip it
+      }
+    }
+    console.log(`Reload signal sent to ${signaled} daemon process(es).`);
+    console.log('agents.json changes (added/removed agents) are now live.');
   });
 
 // Internal command invoked by launchd plist

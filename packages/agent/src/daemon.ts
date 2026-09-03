@@ -35,6 +35,18 @@ function loadAgentsConfig(): AgentDriverConfig[] {
   }
 }
 
+/** Build PtyDriver instances for every pty-type agent in agents.json. */
+function buildDriversFromConfig(): PtyDriver[] {
+  const drivers: PtyDriver[] = [];
+  for (const a of loadAgentsConfig()) {
+    if (a.type === 'pty') {
+      drivers.push(new PtyDriver({ agentId: a.id, command: a.command, args: a.args }));
+    }
+    // BrowserDriver: v2, skip for now
+  }
+  return drivers;
+}
+
 function buildAuthHeader(hostId: string, hostSecret: string): string {
   const ts = Math.floor(Date.now() / 1000);
   const sig = signHmac(hostSecret, hostId, ts);
@@ -50,19 +62,26 @@ async function isAvailable(command: string): Promise<boolean> {
   }
 }
 
+/** Timestamped stderr log — launchd/nohup redirect this to agent.err.log. */
+function log(msg: string): void {
+  process.stderr.write(`[airelay-agent ${new Date().toISOString()}] ${msg}\n`);
+}
+
 export function startDaemon(): void {
   const config = loadConfig();
   const sessionManager = new SessionManager();
 
   // Register drivers from agents.json
-  for (const a of loadAgentsConfig()) {
-    if (a.type === 'pty') {
-      sessionManager.registerDriver(
-        new PtyDriver({ agentId: a.id, command: a.command, args: a.args }),
-      );
-    }
-    // BrowserDriver: v2, skip for now
-  }
+  sessionManager.syncDrivers(buildDriversFromConfig());
+
+  // Reload drivers on SIGHUP (sent by `airelay agent reload`). Safe to call
+  // at any time: syncDrivers preserves live sessions' driver instances.
+  process.on('SIGHUP', () => {
+    const { added, removed } = sessionManager.syncDrivers(buildDriversFromConfig());
+    log(`agents.json reloaded (SIGHUP): +${added.length} -${removed.length}`);
+    if (added.length) log(`  added: ${added.join(', ')}`);
+    if (removed.length) log(`  removed: ${removed.join(', ')}`);
+  });
 
   // Restore surviving sessions from before restart
   sessionManager.restore().catch(() => {});
@@ -158,7 +177,14 @@ export function startDaemon(): void {
         send({ type: 'error', code: 'AGENT_NOT_FOUND' as ErrorCode, message: 'Invalid agent_id' });
         return;
       }
-      const driver = sessionManager.getDriver(agentId);
+      let driver = sessionManager.getDriver(agentId);
+      if (!driver) {
+        // The agent may have been added to agents.json after the daemon
+        // started (or after a SIGHUP race). Re-sync from disk once before
+        // giving up, so new agents work without a daemon restart.
+        sessionManager.syncDrivers(buildDriversFromConfig());
+      }
+      driver = sessionManager.getDriver(agentId);
       if (!driver) {
         send({ type: 'error', code: 'AGENT_NOT_FOUND' as ErrorCode, message: `Agent not found: ${agentId}` });
         return;
