@@ -1,4 +1,7 @@
-// WebSocket manager with auto-reconnect and session_token persistence.
+// WebSocket manager with auto-reconnect, session_token persistence,
+// and optional E2E encryption (ECDH + AES-256-GCM).
+
+import { E2eSession, type E2ePayload } from './e2e.js';
 
 export type MessageHandler = (msg: Record<string, unknown>) => void;
 
@@ -10,12 +13,11 @@ export class WSManager {
   private reconnectDelay = 1000;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private onStatusChange: (connected: boolean, reconnecting: boolean) => void = () => {};
-  // Fired once when the relay rejects auth (close 4001) — i.e. the session
-  // token is expired/invalid/revoked. Distinct from onStatusChange because the
-  // caller needs to stop the reconnect loop and prompt a re-scan rather than
-  // silently retry a dead token forever. Single callback, replaced via
-  // setAuthFailCallback (mirrors setStatusCallback's shape).
   private onAuthFail: () => void = () => {};
+
+  // ── E2E state ───────────────────────────────────────────────────────────
+  private e2eSecret: string | null = null; // hex, from HostEntry; null = no E2E
+  private e2eSession: E2eSession | null = null;
 
   setStatusCallback(cb: (connected: boolean, reconnecting: boolean) => void): void {
     this.onStatusChange = cb;
@@ -25,19 +27,17 @@ export class WSManager {
     this.onAuthFail = cb;
   }
 
+  /** Set the E2E secret for the next connection. null = plaintext mode. */
+  setE2eSecret(secret: string | null): void {
+    this.e2eSecret = secret;
+  }
+
   on(handler: MessageHandler): () => void {
     this.handlers.add(handler);
     return () => this.handlers.delete(handler);
   }
 
   connect(relayUrl: string, token: string): void {
-    // Clear any pending reconnect from a PREVIOUS socket before we touch
-    // url/token. Without this, a stale timer from the old connection's onclose
-    // fires doConnect(), which closes this brand-new socket and reconnects to
-    // the OLD url — so switching hosts via connect() alone would bounce back.
-    // disconnect() already clears it; doing it here makes every connect() safe
-    // (the QR/sessions/default routes also call connect() while a prior socket
-    // may have a pending reconnect).
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
@@ -45,6 +45,8 @@ export class WSManager {
     this.url = relayUrl.replace(/^http/, 'ws') + '/ws/client';
     this.token = token;
     this.reconnectDelay = 1000;
+    // Reset E2E session on every (re)connect — new ECDH handshake needed.
+    this.e2eSession = null;
     this.doConnect();
   }
 
@@ -58,11 +60,6 @@ export class WSManager {
     this.ws = ws;
 
     ws.onopen = () => {
-      // Send token as first message for auth. Do NOT signal "connected" yet —
-      // the socket is open but the relay has not verified the token. We flip
-      // to connected only on receiving {type:'authed'} (see onmessage), so
-      // that any request fired on connect (e.g. list_sessions) lands after
-      // auth completes instead of being rejected/closing the socket.
       ws.send(JSON.stringify({ type: 'auth', token: this.token }));
       this.reconnectDelay = 1000;
     };
@@ -81,9 +78,35 @@ export class WSManager {
         this.token = msg['session_token'] as string;
       }
 
-      // Relay confirms auth is complete — now the connection is truly usable.
+      // Relay confirms auth — initiate E2E handshake if we have a secret.
       if (msg['type'] === 'authed') {
         this.onStatusChange(true, false);
+        if (this.e2eSecret) {
+          this.initiateE2eHandshake();
+        }
+        return;
+      }
+
+      // E2E handshake response from agent
+      if (msg['type'] === 'e2e_ack' && this.e2eSession) {
+        this.e2eSession.handleAck(msg as { pub: string; sig: string }).then((ok) => {
+          if (!ok) console.warn('E2E handshake failed — sig verification error');
+        });
+        return; // don't forward handshake messages to UI handlers
+      }
+
+      // Transparent E2E decryption: if the message has an `e2e` field, decrypt
+      // it back into `data` before handing to handlers. This makes terminal.ts
+      // / sessions.ts completely unaware of encryption.
+      if (msg['e2e'] && this.e2eSession?.isReady) {
+        this.e2eSession.decrypt(msg['e2e'] as E2ePayload).then((plaintext) => {
+          msg['data'] = plaintext;
+          delete msg['e2e'];
+          for (const h of this.handlers) h(msg);
+        }).catch(() => {
+          // Decryption failed — drop the message (tampered or wrong key).
+          console.warn('E2E decryption failed, dropping message');
+        });
         return;
       }
 
@@ -92,14 +115,7 @@ export class WSManager {
 
     ws.onclose = (ev: CloseEvent) => {
       this.ws = null;
-      // 4001 = the relay rejected our auth (token expired / invalid / revoked).
-      // The token is dead — retrying on backoff just hammers a dead credential
-      // forever. Stop the reconnect loop and surface a one-shot onAuthFail so
-      // the UI can prompt a re-scan instead of spinning. (The relay also sends
-      // a {type:'error',code:'AUTH_FAILED'} just before close; that lands in
-      // onmessage but we treat close-code as the authoritative signal since
-      // it's guaranteed.) 4002 (agent offline) and anything else → keep the
-      // normal reconnect loop: the token is fine, the host is just down.
+      this.e2eSession = null; // E2E state dies with the connection
       if (ev.code === 4001) {
         this.onStatusChange(false, false);
         this.onAuthFail();
@@ -115,10 +131,26 @@ export class WSManager {
     ws.onerror = () => { /* handled by onclose */ };
   }
 
+  /**
+   * Send a message. If E2E is ready and the message type is 'input' (terminal
+   * data), transparently encrypt the `data` field into an `e2e` payload. All
+   * other message types (attach, detach, resize, list_sessions, etc.) are sent
+   * in plaintext — the relay needs their metadata for routing/cleanup.
+   */
   send(msg: unknown): void {
-    if (this.ws?.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify(msg));
+    if (this.ws?.readyState !== WebSocket.OPEN) return;
+    const obj = msg as Record<string, unknown>;
+    if (obj['type'] === 'input' && typeof obj['data'] === 'string' && this.e2eSession?.isReady) {
+      // Encrypt asynchronously, then send
+      this.e2eSession.encrypt(obj['data'] as string).then((e2e) => {
+        const encrypted = { type: obj['type'], session_id: obj['session_id'], e2e };
+        if (this.ws?.readyState === WebSocket.OPEN) {
+          this.ws.send(JSON.stringify(encrypted));
+        }
+      });
+      return;
     }
+    this.ws.send(JSON.stringify(msg));
   }
 
   disconnect(): void {
@@ -128,11 +160,22 @@ export class WSManager {
       this.ws.close();
       this.ws = null;
     }
+    this.e2eSession = null;
     this.onStatusChange(false, false);
   }
 
   get connected(): boolean {
     return this.ws?.readyState === WebSocket.OPEN;
+  }
+
+  // ── E2E handshake initiation ──────────────────────────────────────────────
+  private async initiateE2eHandshake(): Promise<void> {
+    if (!this.e2eSecret) return;
+    this.e2eSession = new E2eSession(this.e2eSecret);
+    const hello = await this.e2eSession.createHello();
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify(hello));
+    }
   }
 }
 

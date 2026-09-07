@@ -154,6 +154,29 @@ export interface SessionTokenIssuedMsg {
   session_token: string;
 }
 
+// ── E2E encryption ──────────────────────────────────────────────────────────
+
+/** Encrypted payload (replaces the `data` field when E2E is active). */
+export interface E2ePayload {
+  v: 1;
+  iv: string;   // base64, 12-byte AES-GCM nonce
+  ct: string;   // base64, ciphertext || 16-byte GCM auth tag
+}
+
+/** Client → Agent: initiate ECDH key exchange. */
+export interface E2eHelloMsg {
+  type: 'e2e_hello';
+  pub: string;  // base64, raw P-256 public key (65 bytes uncompressed)
+  sig: string;  // base64, HMAC-SHA256(e2e_secret, pub) — prevents relay MITM
+}
+
+/** Agent → Client: complete ECDH key exchange. */
+export interface E2eAckMsg {
+  type: 'e2e_ack';
+  pub: string;
+  sig: string;
+}
+
 // ── Agent driver config (agents.json) ─────────────────────────────────────────
 
 export interface PtyDriverConfig {

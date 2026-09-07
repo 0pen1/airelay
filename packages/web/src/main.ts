@@ -41,6 +41,9 @@ function ensureHostConnected(hostId: string): boolean {
     return true;
   }
   setActiveHostId(hostId);
+  // Set the E2E secret BEFORE connect so the authed handler can initiate the
+  // handshake immediately. null = no E2E (legacy QR without e2e_secret).
+  wsManager.setE2eSecret(entry.e2e_secret ?? null);
   wsManager.connect(entry.relay_url, entry.session_token);
   return false;
 }
@@ -57,7 +60,9 @@ function route(): void {
     const parsed = parseTokenString(rawHash);
     if (parsed && parsed.relay_url) {
       history.replaceState(null, '', '/'); // strip payload from URL bar/history
-      addHostAndConnect(parsed.host_id, parsed.relay_url, parsed.token);
+      // Set E2E secret before connect so the handshake fires on authed.
+      wsManager.setE2eSecret(parsed.e2e_secret ?? null);
+      addHostAndConnect(parsed.host_id, parsed.relay_url, parsed.token, parsed.e2e_secret);
       // On a successful connect the relay issues a session_token (captured
       // centrally) and sends {type:'authed'}; the sessions view we land on
       // requests the list once authed. Navigate there now.

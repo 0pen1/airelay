@@ -26,6 +26,7 @@ export interface HostEntry {
   nickname: string;       // local-only display name
   emoji: string;          // default '💻'
   added_at: number;       // ms
+  e2e_secret?: string;    // hex, derived from host_secret; for E2E ECDH auth
 }
 
 // ── migration (forced re-scan) ───────────────────────────────────────────────
@@ -152,6 +153,7 @@ export interface ParsedToken {
   host_id: string;
   relay_url: string | null; // null when the input was a bare JWT (caller must supply a URL)
   token: string;
+  e2e_secret?: string;      // hex, present in QR payloads with E2E support
 }
 
 /**
@@ -168,12 +170,19 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 
 export function parseTokenString(input: string, fallbackUrl?: string): ParsedToken | null {
   const s = input.trim();
-  // Try as QR payload: base64url → JSON {url, host_id, token}
+  // Try as QR payload: base64url → JSON {url, host_id, token, e2e_secret?}
   try {
     const decoded = atob(s.replace(/-/g, '+').replace(/_/g, '/'));
-    const json = JSON.parse(decoded) as { url?: string; host_id?: string; token?: string };
+    const json = JSON.parse(decoded) as {
+      url?: string; host_id?: string; token?: string; e2e_secret?: string;
+    };
     if (json.host_id && json.token && UUID_RE.test(json.host_id)) {
-      return { host_id: json.host_id, relay_url: json.url ?? null, token: json.token };
+      return {
+        host_id: json.host_id,
+        relay_url: json.url ?? null,
+        token: json.token,
+        e2e_secret: json.e2e_secret,
+      };
     }
   } catch { /* not a base64 JSON payload */ }
   // Try as JWT: split on '.', decode middle segment → {hostId, ...}
@@ -199,7 +208,7 @@ export function parseTokenString(input: string, fallbackUrl?: string): ParsedTok
  * to update. Re-scanning an existing host_id refreshes its token (and keeps the
  * user's nickname). Returns the host_id.
  */
-export function addHostAndConnect(hostId: string, relayUrl: string, jwt: string): string {
+export function addHostAndConnect(hostId: string, relayUrl: string, jwt: string, e2eSecret?: string): string {
   const existing = getHost(hostId);
   const entry: HostEntry = {
     host_id: hostId,
@@ -208,6 +217,7 @@ export function addHostAndConnect(hostId: string, relayUrl: string, jwt: string)
     nickname: existing?.nickname ?? defaultNickname(relayUrl),
     emoji: existing?.emoji ?? '💻',
     added_at: existing?.added_at ?? Date.now(),
+    e2e_secret: e2eSecret ?? existing?.e2e_secret,
   };
   addHost(entry);
   setActiveHostId(hostId);

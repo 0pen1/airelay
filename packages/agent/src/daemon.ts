@@ -2,6 +2,7 @@ import { WebSocket } from 'ws';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
+import { createHmac } from 'node:crypto';
 import { signHmac, validateSessionId, validateAgentId } from '@airelay/shared';
 import type {
   ClientToAgentMsg, AgentDriverConfig, PtyDriverConfig,
@@ -10,6 +11,7 @@ import type {
 import { SessionManager } from './sessions.js';
 import { PtyDriver } from './drivers/pty-driver.js';
 import type { Disposable } from './drivers/types.js';
+import { E2eSession, type E2ePayload } from './e2e.js';
 import { execFile as execFileCb } from 'node:child_process';
 import { promisify } from 'node:util';
 
@@ -73,6 +75,15 @@ function log(msg: string): void {
 export function startDaemon(): void {
   const config = loadConfig();
   const sessionManager = new SessionManager();
+
+  // ── E2E encryption setup ───────────────────────────────────────────────────
+  // Derive e2e_secret from host_secret (same derivation as gen-token).
+  const e2eSecret = createHmac('sha256', config.hostSecret)
+    .update('airelay-e2e-auth')
+    .digest('hex');
+  // One E2E session per connected client (currently single-client architecture,
+  // but keyed for future multi-client). Reset on each e2e_hello.
+  let e2e: E2eSession | null = null;
 
   // Active output/exit subscriptions per session, so we can dispose them on
   // detach/disconnect. Without this, a re-attach (e.g. after daemon restart,
@@ -151,12 +162,31 @@ export function startDaemon(): void {
   async function handleMessage(msg: Record<string, unknown>, _ws: WebSocket): Promise<void> {
     const type = msg['type'] as string;
 
+    // ── E2E handshake ─────────────────────────────────────────────────────
+    if (type === 'e2e_hello') {
+      const session = new E2eSession(e2eSecret);
+      const ack = session.handleHello(msg as { pub: string; sig: string });
+      if (ack) {
+        // Replace the session-level E2E state. All subsequent output/scrollback
+        // for this client will be encrypted; input with an `e2e` field will be
+        // decrypted. A fresh E2eSession per hello = new ECDH keys = forward
+        // secrecy per connection.
+        e2e = session;
+        send(ack);
+        log('E2E handshake completed');
+      } else {
+        log('E2E handshake failed — sig verification error');
+      }
+      return;
+    }
+
     if (type === 'client_disconnected') {
       const sid = msg['session_id'] as string | undefined;
       if (sid) {
         sessionManager.unlock(sid);
         disposeSubs(sid);
       }
+      e2e = null; // E2E session dies with the client
       return;
     }
 
@@ -232,7 +262,19 @@ export function startDaemon(): void {
 
     if (type === 'input') {
       const sessionId = msg['session_id'] as string | undefined;
-      const data = msg['data'] as string | undefined;
+      // If the message has an `e2e` field, decrypt it to recover the plaintext
+      // data. Fall back to the plain `data` field for backward compatibility
+      // (clients without E2E / legacy QR tokens).
+      let data: string | undefined;
+      if (msg['e2e'] && e2e?.isReady) {
+        try {
+          data = e2e.decrypt(msg['e2e'] as E2ePayload);
+        } catch {
+          return; // decryption failed — drop (tampered or wrong key)
+        }
+      } else {
+        data = msg['data'] as string | undefined;
+      }
       if (!sessionId || !validateSessionId(sessionId) || data === undefined) return;
       const session = sessionManager.get(sessionId);
       if (!session) return;
@@ -288,9 +330,14 @@ export function startDaemon(): void {
     disposeSubs(sessionId);
     const list: Disposable[] = [];
     list.push(
-      session.driver.onOutput(sessionId, (data) =>
-        send({ type: 'output', session_id: sessionId, data }),
-      ),
+      session.driver.onOutput(sessionId, (data) => {
+        if (e2e?.isReady) {
+          const payload = e2e.encrypt(data);
+          send({ type: 'output', session_id: sessionId, e2e: payload });
+        } else {
+          send({ type: 'output', session_id: sessionId, data });
+        }
+      }),
     );
     list.push(
       session.driver.onExit(sessionId, (code) => {
@@ -301,7 +348,7 @@ export function startDaemon(): void {
     );
     subs.set(sessionId, list);
 
-    // Send scrollback in 64 KB chunks
+    // Send scrollback in 64 KB chunks (encrypted if E2E is active)
     try {
       const scrollback = await session.driver.getScrollback(sessionId);
       const chunks: string[] = [];
@@ -309,10 +356,18 @@ export function startDaemon(): void {
         chunks.push(scrollback.slice(i, i + CHUNK_SIZE));
       }
       if (chunks.length === 0) {
-        send({ type: 'scrollback', session_id: sessionId, data: '', seq: 0, done: true });
+        if (e2e?.isReady) {
+          send({ type: 'scrollback', session_id: sessionId, e2e: e2e.encrypt(''), seq: 0, done: true });
+        } else {
+          send({ type: 'scrollback', session_id: sessionId, data: '', seq: 0, done: true });
+        }
       } else {
         chunks.forEach((chunk, idx) => {
-          send({ type: 'scrollback', session_id: sessionId, data: chunk, seq: idx, done: idx === chunks.length - 1 });
+          if (e2e?.isReady) {
+            send({ type: 'scrollback', session_id: sessionId, e2e: e2e.encrypt(chunk), seq: idx, done: idx === chunks.length - 1 });
+          } else {
+            send({ type: 'scrollback', session_id: sessionId, data: chunk, seq: idx, done: idx === chunks.length - 1 });
+          }
         });
       }
     } catch { /* scrollback is best-effort */ }

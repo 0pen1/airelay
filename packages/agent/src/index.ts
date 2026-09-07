@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { Command } from 'commander';
-import { randomBytes } from 'node:crypto';
+import { randomBytes, createHmac } from 'node:crypto';
 import { mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
@@ -156,8 +156,16 @@ program
       exp,
     });
 
+    // Derive a separate E2E secret from the host secret — used by the phone
+    // and agent to authenticate ECDH public keys and prevent relay MITM. We
+    // don't give the phone the raw hostSecret (that's the agent↔relay HMAC
+    // credential); instead we derive a purpose-specific key.
+    const e2eSecret = createHmac('sha256', config.hostSecret)
+      .update('airelay-e2e-auth')
+      .digest('hex');
+
     const payload = Buffer.from(
-      JSON.stringify({ url: config.relayUrl, host_id: config.hostId, token }),
+      JSON.stringify({ url: config.relayUrl, host_id: config.hostId, token, e2e_secret: e2eSecret }),
     ).toString('base64url');
 
     const url = `${config.relayUrl}/#${payload}`;
