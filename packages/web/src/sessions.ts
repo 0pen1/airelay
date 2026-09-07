@@ -1,5 +1,6 @@
 import { wsManager } from './ws.js';
 import { hostScopedHash } from './hosts.js';
+import { notifyNewOutput } from './notify.js';
 
 interface AgentTypeInfo {
   id: string;
@@ -353,13 +354,16 @@ export function mountSessions(app: HTMLElement): () => void {
       });
       renderSessions();
     } else if (msg['type'] === 'output') {
-      // Output for a session we're not viewing → mark unread.
+      // Output for a session we're not viewing → mark unread + notify.
       const sid = msg['session_id'] as string;
       const st = status.get(sid);
       if (st && !st.has_unread) {
         st.has_unread = true;
         renderSessions();
       }
+      // Foreground notification if page is hidden (user on another tab/app)
+      const info = sessions.find((s) => s.session_id === sid);
+      notifyNewOutput(info?.agent_name ?? 'Agent');
     } else if (msg['type'] === 'agent_types') {
       agentTypes = msg['agents'] as AgentTypeInfo[];
       renderAgentTypes();

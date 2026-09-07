@@ -4,6 +4,7 @@ import { WebLinksAddon } from '@xterm/addon-web-links';
 import { wsManager } from './ws.js';
 import { hostScopedHash } from './hosts.js';
 import { VoiceInput } from './voice.js';
+import { clearNotifications } from './notify.js';
 
 export function mountTerminal(app: HTMLElement, sessionId: string): () => void {
   app.innerHTML = `
@@ -156,6 +157,9 @@ export function mountTerminal(app: HTMLElement, sessionId: string): () => void {
   term.loadAddon(fitAddon);
   term.loadAddon(webLinksAddon);
   term.open(termContainer);
+
+  // Clear any pending new-output notification; the user is now viewing this session.
+  clearNotifications();
 
   function fitAndSync(): void {
     fitAddon.fit();
