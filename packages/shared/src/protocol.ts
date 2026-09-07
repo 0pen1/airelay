@@ -77,6 +77,16 @@ export interface SessionsListMsg {
   sessions: SessionInfo[];
 }
 
+/** Session activity status — broadcast by the agent whenever a session's
+ *  output activity state changes (throttled), and pushed for all sessions
+ *  when the client requests the list or attaches. */
+export interface SessionStatusMsg {
+  type: 'session_status';
+  session_id: string;
+  running: boolean;        // true = output activity in the last IDLE_THRESHOLD
+  last_activity: number;   // unix seconds of last output activity
+}
+
 export interface SessionCreatedMsg {
   type: 'session_created';
   session_id: string;
@@ -129,6 +139,7 @@ export interface ErrorMsg {
 export type AgentToClientMsg =
   | AgentTypesMsg
   | SessionsListMsg
+  | SessionStatusMsg
   | SessionCreatedMsg
   | AttachedMsg
   | ScrollbackMsg

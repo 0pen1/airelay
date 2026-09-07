@@ -8,9 +8,9 @@ import type {
   ClientToAgentMsg, AgentDriverConfig, PtyDriverConfig,
   AgentTypeInfo, SessionInfo, ErrorCode,
 } from '@airelay/shared';
-import { SessionManager } from './sessions.js';
+import { SessionManager, type SessionEntry } from './sessions.js';
 import { PtyDriver } from './drivers/pty-driver.js';
-import type { Disposable } from './drivers/types.js';
+import type { Disposable, AgentDriver } from './drivers/types.js';
 import { E2eSession, type E2ePayload } from './e2e.js';
 import { execFile as execFileCb } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -91,6 +91,52 @@ export function startDaemon(): void {
   // forward tmux output to the client — the terminal would freeze.
   const subs = new Map<string, Disposable[]>();
 
+  // ── Session activity tracking ──────────────────────────────────────────────
+  // Watches every session's output independent of attach state, so the phone's
+  // session list can show which agents are actively working (running) vs
+  // waiting for input (idle). A session is "running" if it produced output
+  // within IDLE_THRESHOLD_MS; otherwise "idle". Status transitions broadcast
+  // as session_status messages (throttled to avoid flooding on chatty output).
+  const IDLE_THRESHOLD_MS = 3000;
+  const STATUS_MIN_INTERVAL_MS = 1000;
+  const activity = new Map<string, { lastOutput: number; running: boolean; lastSent: number }>();
+
+  function broadcastStatus(sessionId: string, force = false): void {
+    const a = activity.get(sessionId);
+    if (!a) return;
+    const running = Date.now() - a.lastOutput < IDLE_THRESHOLD_MS;
+    const now = Date.now();
+    if (running === a.running && !force) return; // no state change
+    if (!force && now - a.lastSent < STATUS_MIN_INTERVAL_MS) return; // throttle
+    a.running = running;
+    a.lastSent = now;
+    send({
+      type: 'session_status',
+      session_id: sessionId,
+      running,
+      last_activity: Math.floor(a.lastOutput / 1000),
+    });
+  }
+
+  /** Register an activity watcher for a session (idempotent per session). */
+  function watchActivity(session: SessionEntry & { driver: AgentDriver }): void {
+    if (activity.has(session.sessionId)) return;
+    activity.set(session.sessionId, {
+      lastOutput: 0, running: false, lastSent: 0,
+    });
+    session.driver.onOutput(session.sessionId, () => {
+      const a = activity.get(session.sessionId);
+      if (!a) return;
+      a.lastOutput = Date.now();
+      broadcastStatus(session.sessionId);
+    });
+  }
+
+  /** Push status for all sessions (used on list/attach so the phone gets fresh state). */
+  function pushAllStatus(): void {
+    for (const sessionId of activity.keys()) broadcastStatus(sessionId, true);
+  }
+
   function disposeSubs(sessionId: string): void {
     const list = subs.get(sessionId);
     if (list) {
@@ -111,8 +157,13 @@ export function startDaemon(): void {
     if (removed.length) log(`  removed: ${removed.join(', ')}`);
   });
 
-  // Restore surviving sessions from before restart
-  sessionManager.restore().catch(() => {});
+  // Restore surviving sessions from before restart, then set up activity watchers
+  sessionManager.restore().then(() => {
+    for (const s of sessionManager.list()) {
+      const full = sessionManager.get(s.sessionId);
+      if (full) watchActivity(full);
+    }
+  }).catch(() => {});
 
   let ws: WebSocket | null = null;
   let reconnectDelay = 1000;
@@ -228,6 +279,9 @@ export function startDaemon(): void {
         };
       });
       send({ type: 'sessions_list', sessions });
+      // Push fresh status for all sessions so the phone shows accurate
+      // running/idle state immediately, not just after the next state change.
+      pushAllStatus();
       return;
     }
 
@@ -251,6 +305,10 @@ export function startDaemon(): void {
       }
       try {
         const sessionId = await sessionManager.create(agentId);
+        // Register activity watcher before sending session_created, so output
+        // from the agent startup is tracked even before the client attaches.
+        const full = sessionManager.get(sessionId);
+        if (full) watchActivity(full);
         send({ type: 'session_created', session_id: sessionId, agent_id: agentId });
         // Auto-attach (doAttach wires up output/exit forwarding)
         await doAttach(sessionId, 'auto');
@@ -353,6 +411,7 @@ export function startDaemon(): void {
       session.driver.onExit(sessionId, (code) => {
         send({ type: 'session_exited', session_id: sessionId, code });
         disposeSubs(sessionId);
+        activity.delete(sessionId);
         sessionManager.remove(sessionId).catch(() => {});
       }),
     );

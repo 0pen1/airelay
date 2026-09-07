@@ -17,6 +17,12 @@ interface SessionInfo {
   locked_by: string | null;
 }
 
+interface SessionStatus {
+  running: boolean;
+  last_activity: number;
+  has_unread: boolean;
+}
+
 function relativeTime(ts: number): string {
   const diff = Math.floor(Date.now() / 1000) - ts;
   if (diff < 60) return 'just now';
@@ -29,6 +35,10 @@ export function mountSessions(app: HTMLElement): () => void {
   let sessions: SessionInfo[] = [];
   let agentTypes: AgentTypeInfo[] = [];
   let sheetOpen = false;
+  // Per-session status map: running/idle + unread-output flag.
+  // has_unread is set when a non-focused session produces output; cleared
+  // when the user opens that session's terminal.
+  const status = new Map<string, SessionStatus>();
 
   app.innerHTML = `
     <div class="sessions-layout">
@@ -131,6 +141,15 @@ export function mountSessions(app: HTMLElement): () => void {
         white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
       }
       .session-meta { font-size: 0.8125rem; color: var(--color-text-muted); margin-top: 2px; }
+      .session-running {
+        width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0;
+        background: oklch(65% 0.18 80);
+        animation: pulse 1s ease-in-out infinite;
+      }
+      .session-unread {
+        width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0;
+        background: oklch(55% 0.15 145);
+      }
       .session-lock {
         font-size: 0.75rem; color: var(--color-text-muted);
         background: var(--color-bg); border: 1px solid var(--color-border);
@@ -232,6 +251,7 @@ export function mountSessions(app: HTMLElement): () => void {
     sessionsEmpty.hidden = true;
     for (const s of sessions) {
       const occupied = s.locked_by !== null;
+      const st = status.get(s.session_id);
       const card = document.createElement('div');
       card.className = 'session-card';
       card.setAttribute('role', 'listitem');
@@ -243,11 +263,16 @@ export function mountSessions(app: HTMLElement): () => void {
           <div class="session-name">${s.agent_name}</div>
           <div class="session-meta">${relativeTime(s.created_at)}</div>
         </div>
+        ${st?.running ? '<span class="session-running" title="Working…" aria-label="Running"></span>' : ''}
+        ${st?.has_unread && !occupied ? '<span class="session-unread" aria-label="New output"></span>' : ''}
         ${occupied ? '<span class="session-lock">In use</span>' : ''}
       `;
       if (!occupied) {
         card.addEventListener('click', () => {
           wsManager.send({ type: 'attach', session_id: s.session_id });
+          // Clear unread when the user opens the session
+          const cur = status.get(s.session_id);
+          if (cur) cur.has_unread = false;
           location.hash = hostScopedHash(`/terminal/${s.session_id}`);
         });
         card.addEventListener('keydown', (e) => {
@@ -311,11 +336,37 @@ export function mountSessions(app: HTMLElement): () => void {
       receivedList = true;
       sessions = msg['sessions'] as SessionInfo[];
       renderSessions();
+    } else if (msg['type'] === 'session_status') {
+      const sid = msg['session_id'] as string;
+      const running = msg['running'] as boolean;
+      const lastActivity = msg['last_activity'] as number;
+      const prev = status.get(sid);
+      // Mark as unread when the session becomes running (new output) and
+      // we're on the sessions list (not viewing that terminal). Never mark
+      // the session we just came from as unread (has_unread starts false).
+      const wasRunning = prev?.running ?? false;
+      const hasUnread = prev?.has_unread ?? false;
+      status.set(sid, {
+        running,
+        last_activity: lastActivity,
+        has_unread: hasUnread || (!wasRunning && running),
+      });
+      renderSessions();
+    } else if (msg['type'] === 'output') {
+      // Output for a session we're not viewing → mark unread.
+      const sid = msg['session_id'] as string;
+      const st = status.get(sid);
+      if (st && !st.has_unread) {
+        st.has_unread = true;
+        renderSessions();
+      }
     } else if (msg['type'] === 'agent_types') {
       agentTypes = msg['agents'] as AgentTypeInfo[];
       renderAgentTypes();
     } else if (msg['type'] === 'session_created') {
       const sid = msg['session_id'] as string;
+      // New session starts as read (we're about to open it).
+      status.set(sid, { running: false, last_activity: 0, has_unread: false });
       location.hash = hostScopedHash(`/terminal/${sid}`);
     }
   });
