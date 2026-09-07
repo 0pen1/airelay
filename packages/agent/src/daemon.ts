@@ -127,6 +127,16 @@ export function startDaemon(): void {
       reconnectDelay = 1000;
       ws!.send(JSON.stringify({ type: 'agent_hello', host_id: config.hostId, version: '0.1.0' }));
 
+      // On (re)connect, unlock all sessions. If the relay restarted, the old
+      // client connections are gone and no client_disconnected was received,
+      // leaving sessions locked forever. Safe: single-client architecture.
+      sessionManager.unlockAll();
+      // Dispose all output/exit subscriptions — old callbacks reference the
+      // closed WebSocket and would never deliver output. New callbacks are
+      // set up when the client re-attaches.
+      for (const sid of subs.keys()) disposeSubs(sid);
+      e2e = null; // old E2E session is dead
+
       // Heartbeat
       const ping = setInterval(() => {
         if (ws?.readyState === WebSocket.OPEN) ws.ping();

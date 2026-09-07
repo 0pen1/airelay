@@ -147,6 +147,11 @@ export class SessionManager {
     if (s) s.lockedBy = null;
   }
 
+  /** Unlock all sessions — called on reconnect to relay. */
+  unlockAll(): void {
+    for (const s of this.sessions.values()) s.lockedBy = null;
+  }
+
   isLocked(sessionId: string): boolean {
     return (this.sessions.get(sessionId)?.lockedBy ?? null) !== null;
   }
