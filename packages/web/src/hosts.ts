@@ -163,13 +163,16 @@ export interface ParsedToken {
  * unknowable). When the input is a bare JWT, relay_url is null and fallbackUrl
  * (if provided) is substituted.
  */
+/** Loose UUID check — rejects XSS payloads injected as a host_id by a malicious relay. */
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 export function parseTokenString(input: string, fallbackUrl?: string): ParsedToken | null {
   const s = input.trim();
   // Try as QR payload: base64url → JSON {url, host_id, token}
   try {
     const decoded = atob(s.replace(/-/g, '+').replace(/_/g, '/'));
     const json = JSON.parse(decoded) as { url?: string; host_id?: string; token?: string };
-    if (json.host_id && json.token) {
+    if (json.host_id && json.token && UUID_RE.test(json.host_id)) {
       return { host_id: json.host_id, relay_url: json.url ?? null, token: json.token };
     }
   } catch { /* not a base64 JSON payload */ }
@@ -180,7 +183,7 @@ export function parseTokenString(input: string, fallbackUrl?: string): ParsedTok
       const payload = JSON.parse(atob(parts[1].replace(/-/g, '+').replace(/_/g, '/'))) as {
         hostId?: string;
       };
-      if (payload.hostId) {
+      if (payload.hostId && UUID_RE.test(payload.hostId)) {
         return { host_id: payload.hostId, relay_url: fallbackUrl ?? null, token: s };
       }
     } catch { /* not a JWT */ }

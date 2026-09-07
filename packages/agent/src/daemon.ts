@@ -10,10 +10,10 @@ import type {
 import { SessionManager } from './sessions.js';
 import { PtyDriver } from './drivers/pty-driver.js';
 import type { Disposable } from './drivers/types.js';
-import { exec as execCb } from 'node:child_process';
+import { execFile as execFileCb } from 'node:child_process';
 import { promisify } from 'node:util';
 
-const exec = promisify(execCb);
+const execFile = promisify(execFileCb);
 const CONFIG_DIR = join(homedir(), '.config', 'airelay');
 const CHUNK_SIZE = 64 * 1024; // 64 KB
 
@@ -56,7 +56,9 @@ function buildAuthHeader(hostId: string, hostSecret: string): string {
 
 async function isAvailable(command: string): Promise<boolean> {
   try {
-    await exec(`which ${command}`);
+    // execFile (no shell) — command comes from agents.json (local config), but
+    // avoid shell interpolation regardless.
+    await execFile('which', [command]);
     return true;
   } catch {
     return false;
@@ -240,9 +242,16 @@ export function startDaemon(): void {
 
     if (type === 'resize') {
       const sessionId = msg['session_id'] as string | undefined;
-      const cols = msg['cols'] as number | undefined;
-      const rows = msg['rows'] as number | undefined;
-      if (!sessionId || !validateSessionId(sessionId) || !cols || !rows) return;
+      const cols = msg['cols'];
+      const rows = msg['rows'];
+      // cols/rows flow into a tmux shell command (`-x ${cols} -y ${rows}`), so
+      // they MUST be integers — a string like "100; rm -rf /" would inject a
+      // second command. TypeScript's `as number` is compile-time only; verify
+      // at runtime. Bound the range to sane terminal sizes.
+      if (!sessionId || !validateSessionId(sessionId)) return;
+      if (typeof cols !== 'number' || typeof rows !== 'number') return;
+      if (!Number.isInteger(cols) || !Number.isInteger(rows)) return;
+      if (cols < 1 || cols > 5000 || rows < 1 || rows > 5000) return;
       const session = sessionManager.get(sessionId);
       if (!session) return;
       await session.driver.resize(sessionId, cols, rows).catch(() => {});

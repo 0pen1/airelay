@@ -1,13 +1,13 @@
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
-import { exec as execCb } from 'node:child_process';
+import { execFile as execFileCb } from 'node:child_process';
 import { promisify } from 'node:util';
 import { v4 as uuidv4 } from 'uuid';
 import type { AgentDriver } from './drivers/types.js';
 import type { PtyDriverConfig, AgentDriverConfig } from '@airelay/shared';
 
-const exec = promisify(execCb);
+const execFile = promisify(execFileCb);
 const CONFIG_DIR = join(homedir(), '.config', 'airelay');
 const SESSIONS_FILE = join(CONFIG_DIR, 'sessions.json');
 
@@ -72,7 +72,7 @@ export class SessionManager {
   async restore(): Promise<void> {
     let raw: string;
     try {
-      const { stdout } = await exec("tmux list-sessions -F '#{session_name}'");
+      const { stdout } = await execFile('tmux', ['list-sessions', '-F', '#{session_name}']);
       raw = stdout;
     } catch {
       return; // no tmux server running yet

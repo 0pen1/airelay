@@ -1,8 +1,9 @@
-import { spawn, exec as execCb } from 'node:child_process';
+import { spawn, execFile as execFileCb } from 'node:child_process';
 import { promisify } from 'node:util';
 import type { AgentDriver, Disposable } from './types.js';
+import { validateSessionId } from '@airelay/shared';
 
-const exec = promisify(execCb);
+const execFile = promisify(execFileCb);
 
 /**
  * tmux control mode escapes non-printable bytes in %output data as octal \ooo.
@@ -136,9 +137,13 @@ export class PtyDriver implements AgentDriver {
   }
 
   async start(sessionId: string): Promise<void> {
+    if (!validateSessionId(sessionId)) throw new Error('Invalid session ID');
     const id = this.tmuxId(sessionId);
     const cmd = [this.command, ...this.args].join(' ');
-    await exec(`tmux new-session -d -s ${id} "${cmd}"`);
+    // execFile (no shell) — args passed as array, no shell interpolation.
+    // The command+args come from local agents.json (trusted), and sessionId
+    // is UUID-validated above, so there's no injection surface here.
+    await execFile('tmux', ['new-session', '-d', '-s', id, cmd]);
     this.attachControlMode(sessionId, id);
   }
 
@@ -183,12 +188,14 @@ export class PtyDriver implements AgentDriver {
   }
 
   async stop(sessionId: string): Promise<void> {
+    if (!validateSessionId(sessionId)) return;
     const id = this.tmuxId(sessionId);
     this.cleanup(sessionId);
-    await exec(`tmux kill-session -t ${id}`).catch(() => {});
+    await execFile('tmux', ['kill-session', '-t', id]).catch(() => {});
   }
 
   async sendInput(sessionId: string, data: string): Promise<void> {
+    if (!validateSessionId(sessionId)) return;
     const id = this.tmuxId(sessionId);
 
     // Split the input into key-stroke segments. For each segment we pick the
@@ -216,33 +223,40 @@ export class PtyDriver implements AgentDriver {
     //    appropriate for control sequences, which we already route through named
     //    keys above.)
     //
-    //    We shell-quote the literal argument (single quotes, with embedded
-    //    single quotes escaped) so shell metacharacters and spaces in the text
-    //    don't break the command.
+    //    We use execFile (no shell) with the text as a bare array element, so
+    //    no shell quoting is needed — the OS passes the bytes verbatim to tmux.
+    //    (Previously this used exec() with manual single-quote escaping, which
+    //    was correct but fragile; execFile eliminates the shell entirely.)
     const parts = splitKeys(data);
     for (const part of parts) {
       const name = KEY_NAMES.get(part);
       if (name) {
-        await exec(`tmux send-keys -t ${id} ${name}`);
+        await execFile('tmux', ['send-keys', '-t', id, name]);
       } else {
-        const quoted = `'${part.replace(/'/g, `'\\''`)}'`;
-        await exec(`tmux send-keys -t ${id} -l ${quoted}`);
+        await execFile('tmux', ['send-keys', '-t', id, '-l', part]);
       }
     }
   }
 
   async resize(sessionId: string, cols: number, rows: number): Promise<void> {
+    // Defence-in-depth: validate even though daemon.ts already checks. The
+    // values are passed as execFile args (no shell), but non-integers still
+    // make no sense to tmux.
+    if (!validateSessionId(sessionId)) return;
+    if (!Number.isInteger(cols) || !Number.isInteger(rows) ||
+        cols < 1 || cols > 5000 || rows < 1 || rows > 5000) return;
     const id = this.tmuxId(sessionId);
-    await exec(`tmux resize-window -t ${id} -x ${cols} -y ${rows}`).catch(() => {});
+    await execFile('tmux', ['resize-window', '-t', id, '-x', String(cols), '-y', String(rows)]).catch(() => {});
   }
 
   async getScrollback(sessionId: string): Promise<string> {
+    if (!validateSessionId(sessionId)) return '';
     const id = this.tmuxId(sessionId);
     // -e preserves ANSI escape sequences (colors, cursor moves, screen clears).
     // Without it, full-screen TUI apps (Claude Code, codex, vim, …) capture as
     // bare text and xterm.js cannot reconstruct the screen on attach — the
     // terminal renders blank/garbled until the next repaint.
-    const { stdout } = await exec(`tmux capture-pane -p -e -S -5000 -t ${id}`);
+    const { stdout } = await execFile('tmux', ['capture-pane', '-p', '-e', '-S', '-5000', '-t', id]);
     return stdout;
   }
 

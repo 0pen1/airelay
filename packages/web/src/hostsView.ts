@@ -250,7 +250,7 @@ export function mountHosts(app: HTMLElement): () => void {
             <span>${escapeHtml(hostShort(h))}</span>
           </div>
         </div>
-        <button class="host-menu" aria-label="主机菜单" data-menu="${h.host_id}">⋯</button>
+        <button class="host-menu" aria-label="主机菜单" data-menu="${escapeHtml(h.host_id)}">⋯</button>
       `;
       card.addEventListener('click', (e) => {
         if ((e.target as HTMLElement).closest('.host-menu')) return;
