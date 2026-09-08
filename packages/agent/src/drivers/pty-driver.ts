@@ -178,12 +178,18 @@ export class PtyDriver implements AgentDriver {
 
     this.controlProcs.set(sessionId, proc);
 
-    let buf = '';
+    // Byte-level line buffer: pipe chunks split at arbitrary byte offsets,
+    // and a split landing mid-UTF-8-character would permanently corrupt it
+    // if we called chunk.toString() per chunk (U+FFFD replacement). Buffer
+    // raw bytes, cut complete lines at 0x0A (a byte that can never appear
+    // inside a multi-byte UTF-8 sequence), and only then decode.
+    let lineBuf = Buffer.alloc(0);
     proc.stdout.on('data', (chunk: Buffer) => {
-      buf += chunk.toString();
-      const lines = buf.split('\n');
-      buf = lines.pop() ?? '';
-      for (const line of lines) {
+      lineBuf = Buffer.concat([lineBuf, chunk]);
+      let nl: number;
+      while ((nl = lineBuf.indexOf(0x0a)) !== -1) {
+        const line = lineBuf.subarray(0, nl).toString('utf8');
+        lineBuf = lineBuf.subarray(nl + 1);
         if (line.startsWith('%output ')) {
           // Format: %output %<pane-id> <octal-escaped data>
           const afterPane = line.indexOf(' ', 8);

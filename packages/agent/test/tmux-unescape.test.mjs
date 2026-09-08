@@ -65,3 +65,42 @@ test('ANSI color sequences embedded in output', () => {
 test('fast path: strings without backslashes return unchanged', () => {
   assert.equal(unescapeTmux('plain text 你好'), 'plain text 你好');
 });
+
+// ── Chunk-boundary regression (the live-output mojibake bug) ─────────────────
+// Pipe chunks split at arbitrary BYTE offsets. The old reader called
+// chunk.toString() per chunk, so a boundary landing mid-UTF-8-character
+// produced permanent U+FFFD corruption — visible as mojibake whenever
+// output volume was high (e.g. claude's thinking-block redraws).
+
+function decodeLines(chunks) {
+  // Mirror of the fixed reader in pty-driver.ts
+  let lineBuf = Buffer.alloc(0);
+  const lines = [];
+  for (const c of chunks) {
+    lineBuf = Buffer.concat([lineBuf, c]);
+    let nl;
+    while ((nl = lineBuf.indexOf(0x0a)) !== -1) {
+      lines.push(lineBuf.subarray(0, nl).toString('utf8'));
+      lineBuf = lineBuf.subarray(nl + 1);
+    }
+  }
+  return lines;
+}
+
+test('chunk boundary mid-UTF-8-char does not corrupt (regression)', () => {
+  const payload = Buffer.from('你好世界\nplain line\n', 'utf8');
+  // Split at byte 1 — right after the first byte of 你 (E4).
+  const a = payload.subarray(0, 1);
+  const b = payload.subarray(1);
+  const lines = decodeLines([a, b]);
+  assert.equal(lines[0], '你好世界', 'multibyte char split across chunks survives');
+  assert.equal(lines[1], 'plain line');
+});
+
+test('many tiny chunks with multibyte content', () => {
+  const payload = Buffer.from('中文 emoji 🎉 mixed\n', 'utf8');
+  const chunks = [];
+  for (const b of payload) chunks.push(Buffer.from([b])); // one byte per chunk
+  const lines = decodeLines(chunks);
+  assert.equal(lines[0], '中文 emoji 🎉 mixed');
+});
