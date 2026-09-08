@@ -8,6 +8,7 @@
 
 import { BinaryOpcode, decodeBinaryFrame, encodeBinaryFrame } from '@airelay/shared';
 import { E2eSession, type E2ePayload } from './e2e.js';
+import { setupPushSubscription } from './notify.js';
 
 export type MessageHandler = (msg: Record<string, unknown>) => void;
 
@@ -124,6 +125,12 @@ export class WSManager {
         this.onStatusChange(true, false);
         if (this.e2eSecret) {
           this.initiateE2eHandshake();
+        }
+        // Register/refresh the Web Push subscription once per session (needs
+        // the session token that auth just validated). Fire-and-forget.
+        if (!sessionStorage.getItem('airelay_push_done')) {
+          sessionStorage.setItem('airelay_push_done', '1');
+          void setupPushSubscription();
         }
         return;
       }

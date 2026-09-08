@@ -85,6 +85,10 @@ export interface SessionStatusMsg {
   session_id: string;
   running: boolean;        // true = output activity in the last IDLE_THRESHOLD
   last_activity: number;   // unix seconds of last output activity
+  /** true when this message announces a running→idle transition, i.e. the
+   *  agent stopped producing output — usually "waiting for your input". Only
+   *  set on transition messages; absent on periodic pushes. */
+  waiting?: boolean;
 }
 
 export interface SessionCreatedMsg {

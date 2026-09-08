@@ -1,6 +1,6 @@
 import { wsManager } from './ws.js';
 import { hostScopedHash } from './hosts.js';
-import { notifyNewOutput } from './notify.js';
+import { notifyNewOutput, notifyWaiting } from './notify.js';
 
 interface AgentTypeInfo {
   id: string;
@@ -353,6 +353,13 @@ export function mountSessions(app: HTMLElement): () => void {
         has_unread: hasUnread || (!wasRunning && running),
       });
       renderSessions();
+      // running→idle transition = the agent is blocked on user input. Notify
+      // even when the user is on another session's terminal — that's exactly
+      // when they need to come back.
+      if (msg['waiting'] === true) {
+        const info = sessions.find((s) => s.session_id === sid);
+        notifyWaiting(info?.agent_name ?? 'Agent');
+      }
     } else if (msg['type'] === 'output') {
       // Output for a session we're not viewing → mark unread + notify.
       const sid = msg['session_id'] as string;

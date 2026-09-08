@@ -8,8 +8,10 @@ import { verifyAgentAuth, verifyClientJwt, verifySessionTokenAuth } from './auth
 import {
   getHost, addJti, hasJti, createSessionToken, getSessionToken,
   listSessionTokens, revokeSessionToken, rotateSessionToken,
-  cleanExpiredJtis,
+  cleanExpiredJtis, upsertPushSubscription, getPushSubscriptions,
+  deletePushSubscription,
 } from './db.js';
+import { initPush, getVapidPublicKey, sendPush } from './push.js';
 
 // ESM: derive the directory of this module (was __dirname under CJS)
 const __dirname = join(fileURLToPath(import.meta.url), '..');
@@ -41,6 +43,66 @@ export function createRelayServer(port: number): void {
 
   // Periodic cleanup of expired JTIs and token-grace aliases (1/hour).
   setInterval(cleanExpiredJtis, 3600_000).unref();
+
+  // ── Web Push (VAPID) ─────────────────────────────────────────────────────────
+  // Subscriptions are authorized with the client's session token; pushes carry
+  // metadata only ("agent waiting"), never terminal content.
+
+  app.get('/api/push/key', (_req, res) => {
+    res.json({ publicKey: getVapidPublicKey() });
+  });
+
+  app.post('/api/push/subscribe', express.json(), (req, res) => {
+    const token = String(req.headers['authorization']?.replace(/^Bearer\s+/i, '') ?? '');
+    const row = getSessionToken(token);
+    if (!row) {
+      res.status(401).json({ error: 'unauthorized' });
+      return;
+    }
+    const sub = req.body?.['subscription'] as
+      { endpoint?: string; keys?: { p256dh?: string; auth?: string } } | undefined;
+    if (
+      !sub?.endpoint || typeof sub.endpoint !== 'string' ||
+      !sub.keys?.p256dh || !sub.keys?.auth
+    ) {
+      res.status(400).json({ error: 'invalid subscription' });
+      return;
+    }
+    initPush();
+    upsertPushSubscription(sub.endpoint, row.host_id, sub.keys.p256dh, sub.keys.auth, row.device_name);
+    res.json({ ok: true });
+  });
+
+  app.post('/api/push/unsubscribe', express.json(), (req, res) => {
+    const token = String(req.headers['authorization']?.replace(/^Bearer\s+/i, '') ?? '');
+    if (!getSessionToken(token)) {
+      res.status(401).json({ error: 'unauthorized' });
+      return;
+    }
+    const endpoint = String(req.body?.['endpoint'] ?? '');
+    if (endpoint) deletePushSubscription(endpoint);
+    res.json({ ok: true });
+  });
+
+  /** Fire "agent waiting" pushes to all of a host's subscriptions. Failures
+   *  with 404/410 mean the subscription is dead — drop it. */
+  async function pushWaiting(hostId: string): Promise<void> {
+    const subs = getPushSubscriptions(hostId);
+    for (const sub of subs) {
+      try {
+        await sendPush(
+          { endpoint: sub.endpoint, keys: { p256dh: sub.p256dh, auth: sub.auth } },
+          { title: 'airelay', body: 'Your agent is waiting for input' },
+        );
+      } catch (err) {
+        const status = (err as { statusCode?: number }).statusCode;
+        if (status === 404 || status === 410) {
+          deletePushSubscription(sub.endpoint);
+        }
+        // Other errors (network blips): keep the subscription, retry next time.
+      }
+    }
+  }
 
   app.get('/health', (_req, res) => {
     res.json({ ok: true, agents: agents.size, clients: clients.size });
@@ -140,9 +202,14 @@ export function createRelayServer(port: number): void {
             // message still gets forwarded.
             const msg = data.toString();
             try {
-              const parsed = JSON.parse(msg) as { type?: string; session_id?: string };
+              const parsed = JSON.parse(msg) as { type?: string; session_id?: string; waiting?: boolean };
               if (parsed.type === 'session_created' || parsed.type === 'attached') {
                 client.sessionId = parsed.session_id;
+              }
+              // Fire-and-forget: agent went idle → notify subscribed devices.
+              // Not awaited: must never delay the forwarded frame.
+              if (parsed.type === 'session_status' && parsed.waiting === true) {
+                void pushWaiting(hostId);
               }
             } catch { /* not JSON — forward anyway */ }
             if (client.ws.readyState === WebSocket.OPEN) {

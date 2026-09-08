@@ -66,6 +66,18 @@ export function getDb(): DatabaseSync {
       host_id    TEXT NOT NULL,
       expires_at INTEGER NOT NULL
     );
+
+    -- Web Push subscriptions (one per browser/device). Zero-knowledge: the
+    -- relay only ever pushes opaque metadata ("host has activity"), never
+    -- terminal content.
+    CREATE TABLE IF NOT EXISTS push_subscriptions (
+      endpoint  TEXT PRIMARY KEY,
+      host_id   TEXT NOT NULL,
+      p256dh    TEXT NOT NULL,
+      auth      TEXT NOT NULL,
+      device_name TEXT NOT NULL DEFAULT '',
+      created_at INTEGER NOT NULL
+    );
   `);
   // Migrations for pre-existing DBs (CREATE TABLE IF NOT EXISTS won't add
   // columns to an older table).
@@ -206,4 +218,39 @@ export function rotateSessionToken(oldToken: string, ttlSeconds = 7 * 24 * 3600)
     `UPDATE session_tokens SET token = ?, expires_at = ?, last_used_at = ? WHERE token = ?`,
   ).run(newToken, now + ttlSeconds, now, oldToken);
   return newToken;
+}
+
+// ── Push subscriptions ────────────────────────────────────────────────────────
+
+export interface PushSubRow {
+  endpoint: string;
+  host_id: string;
+  p256dh: string;
+  auth: string;
+  device_name: string;
+  created_at: number;
+}
+
+export function upsertPushSubscription(
+  endpoint: string,
+  host_id: string,
+  p256dh: string,
+  auth: string,
+  device_name: string,
+): void {
+  getDb()
+    .prepare(`INSERT OR REPLACE INTO push_subscriptions
+      (endpoint, host_id, p256dh, auth, device_name, created_at)
+      VALUES (?, ?, ?, ?, ?, ?)`)
+    .run(endpoint, host_id, p256dh, auth, device_name, Math.floor(Date.now() / 1000));
+}
+
+export function getPushSubscriptions(host_id: string): PushSubRow[] {
+  return getDb()
+    .prepare('SELECT * FROM push_subscriptions WHERE host_id = ?')
+    .all(host_id) as PushSubRow[];
+}
+
+export function deletePushSubscription(endpoint: string): void {
+  getDb().prepare('DELETE FROM push_subscriptions WHERE endpoint = ?').run(endpoint);
 }

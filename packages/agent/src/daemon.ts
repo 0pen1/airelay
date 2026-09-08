@@ -160,6 +160,10 @@ export function startDaemon(): void {
     const now = Date.now();
     if (running === a.running && !force) return; // no state change
     if (!force && now - a.lastSent < STATUS_MIN_INTERVAL_MS) return; // throttle
+    // waiting = running→idle transition: the agent stopped producing output
+    // and is probably blocked on user input. Drives the phone's
+    // "waiting for you" notification.
+    const waiting = a.running && !running;
     a.running = running;
     a.lastSent = now;
     send({
@@ -167,6 +171,7 @@ export function startDaemon(): void {
       session_id: sessionId,
       running,
       last_activity: Math.floor(a.lastOutput / 1000),
+      ...(waiting ? { waiting: true } : {}),
     });
   }
 
