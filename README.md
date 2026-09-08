@@ -46,6 +46,7 @@
 | [docs/protocol.md](docs/protocol.md)         | WebSocket 消息协议完整定义 |
 | [docs/security.md](docs/security.md)         | 威胁模型、加密算法、攻击场景分析 |
 | [docs/development.md](docs/development.md)   | 开发环境搭建、构建、测试、调试 |
+| [docs/deployment.md](docs/deployment.md)     | VPS 部署：systemd、TLS 反代、防火墙、备份、升级 |
 
 ## 快速开始
 

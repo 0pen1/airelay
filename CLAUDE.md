@@ -24,6 +24,7 @@ This is an npm workspace monorepo:
 | [docs/protocol.md](docs/protocol.md)           | WebSocket message schemas, binary frames, authentication flow                   |
 | [docs/security.md](docs/security.md)           | Threat model, E2E encryption (ECDH + AES-GCM), relay zero-knowledge             |
 | [docs/development.md](docs/development.md)     | Dev setup, build commands, testing, debugging                                   |
+| [docs/deployment.md](docs/deployment.md)       | VPS deployment: systemd, TLS reverse proxy, firewall, backups, upgrades         |
 
 ## Quick start
 

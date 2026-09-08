@@ -68,7 +68,7 @@ function audit(dir: 'agent->client' | 'client->agent', data: Buffer, isBinary: b
   console.log(`[AUDIT ${new Date().toISOString()}] ${dir} host=${hostId} type=${type} bytes=${data.length}`);
 }
 
-export function createRelayServer(port: number): void {
+export function createRelayServer(port: number): { shutdown: () => Promise<void> } {
   const app = express();
 
   // Periodic cleanup of expired JTIs and token-grace aliases (1/hour).
@@ -475,4 +475,32 @@ export function createRelayServer(port: number): void {
   server.listen(port, '127.0.0.1', () => {
     console.log(`airelay relay listening on 127.0.0.1:${port}`);
   });
+
+  /** Graceful shutdown: tell every connected peer WHY the connection is
+   *  going away, then close. Without this a deploy/restart looks identical
+   *  to a network failure — clients retry blindly and sessions stay locked
+   *  on the agent until its own reconnect logic clears them. */
+  function shutdown(): Promise<void> {
+    return new Promise((resolve) => {
+      // Clients: the agent is going away from their perspective.
+      for (const client of clients.values()) {
+        try { sendJson(client.ws, { type: 'agent_disconnected' }); } catch { /* dying anyway */ }
+        try { client.ws.close(1001, 'Server restarting'); } catch { /* already closed */ }
+      }
+      // Agents: drop client locks so restored sessions are immediately attachable.
+      for (const agent of agents.values()) {
+        try { sendJson(agent.ws, { type: 'client_disconnected' }); } catch { /* dying anyway */ }
+        try { agent.ws.close(1001, 'Server restarting'); } catch { /* already closed */ }
+      }
+      // 1001 = "going away", distinct from network-failure codes the client
+      // treats as reconnectable signals.
+      wss.close(() => {
+        server.close(() => resolve());
+      });
+      // Safety: don't hang shutdown on stuck sockets.
+      setTimeout(resolve, 3000).unref();
+    });
+  }
+
+  return { shutdown };
 }

@@ -216,6 +216,21 @@ export function startDaemon(): void {
     if (removed.length) log(`  removed: ${removed.join(', ')}`);
   });
 
+  // Graceful shutdown on SIGTERM (systemd stop) / SIGINT: close the relay
+  // socket so the relay runs its client_disconnected cleanup (unlocks,
+  // disposes subscriptions), persist nothing extra — tmux sessions survive
+  // the daemon by design and restore() re-attaches on next start.
+  let shuttingDown = false;
+  const stop = (signal: string) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    log(`${signal} received — closing relay connection`);
+    try { ws?.close(1001, 'Agent stopping'); } catch { /* already closed */ }
+    process.exit(0);
+  };
+  process.on('SIGTERM', () => stop('SIGTERM'));
+  process.on('SIGINT', () => stop('SIGINT'));
+
   // Restore surviving sessions from before restart, then set up activity watchers
   sessionManager.restore().then(() => {
     for (const s of sessionManager.list()) {

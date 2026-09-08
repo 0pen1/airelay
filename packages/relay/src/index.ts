@@ -23,9 +23,24 @@ program
   .command('start')
   .description('Start the relay server')
   .option('-p, --port <port>', 'Port to listen on', '3000')
-  .action((opts) => {
+  .action(async (opts) => {
     const port = parseInt(opts.port, 10);
-    createRelayServer(port);
+    const relay = createRelayServer(port);
+
+    // Graceful shutdown on SIGTERM (systemd stop) and SIGINT (Ctrl-C):
+    // notify peers, close sockets, exit. systemd's default TimeoutStopSec
+    // (90s) is far beyond what this needs.
+    let shuttingDown = false;
+    const stop = async (signal: string) => {
+      if (shuttingDown) return;
+      shuttingDown = true;
+      console.log(`\n${signal} received — shutting down gracefully…`);
+      await relay.shutdown();
+      console.log('bye');
+      process.exit(0);
+    };
+    process.on('SIGTERM', () => void stop('SIGTERM'));
+    process.on('SIGINT', () => void stop('SIGINT'));
   });
 
 program

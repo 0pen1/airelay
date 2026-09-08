@@ -1,0 +1,15 @@
+{
+  "name": "airelay",
+  "short_name": "airelay",
+  "description": "Your dev environment, in your pocket. Remote AI agent control, end-to-end encrypted.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#1a1a18",
+  "theme_color": "#1a1a18",
+  "icons": [
+    { "src": "/icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png" },
+    { "src": "/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}
