@@ -47,6 +47,11 @@ jobs:
           cd packages/relay
           node --test test/rate-limit.test.mjs
 
+      - name: Auth + token lifecycle unit tests (relay)
+        run: |
+          cd packages/relay
+          node --test test/auth.test.mjs test/db.test.mjs
+
       - name: Zero-knowledge regression test (relay, live stack)
         run: |
           cd packages/relay
