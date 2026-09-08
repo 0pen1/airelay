@@ -516,8 +516,7 @@ export function startDaemon(): void {
     // Send scrollback in 64 KB chunks (encrypted if E2E is active)
     try {
       const scrollback = await session.driver.getScrollback(sessionId);
-      const chunks: string[] = [];
-      for (let i = 0; i < scrollback.length; i += CHUNK_SIZE) {
+      const chunks: string[] = [];      for (let i = 0; i < scrollback.length; i += CHUNK_SIZE) {
         chunks.push(scrollback.slice(i, i + CHUNK_SIZE));
       }
       if (chunks.length === 0) {

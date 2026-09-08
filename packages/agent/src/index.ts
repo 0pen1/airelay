@@ -210,6 +210,96 @@ devices
     console.log(revoked > 0 ? `Revoked ${revoked} token(s) with prefix ${id}.` : `No live token matched ${id}.`);
   });
 
+// ── terminal commands (CLI client) ───────────────────────────────────────────
+// Talk to sessions on this host (or any host whose config you copy) through
+// the relay, with E2E encryption — same protocol as the phone.
+
+const term = program.command('term').description('Interact with agent sessions from the terminal');
+
+term
+  .command('ls')
+  .description('List sessions')
+  .action(async () => {
+    const { CliClient } = await import('./cli-client.js');
+    const client = new CliClient(loadConfig());
+    try {
+      await client.connect();
+      const sessions = await client.listSessions();
+      if (sessions.length === 0) {
+        console.log('No sessions. Start one with `airelay term new <agent>`.');
+        return;
+      }
+      console.log('Sessions:');
+      console.log('─'.repeat(64));
+      for (const s of sessions) {
+        const lock = s.locked_by ? ' (in use)' : '';
+        const age = Math.max(1, Math.floor((Date.now() / 1000 - s.created_at) / 60));
+        console.log(`  ${s.icon} ${s.session_id}  ${s.agent_name}${lock}  ${age}m ago`);
+      }
+    } finally {
+      client.close();
+    }
+  });
+
+term
+  .command('logs <sessionId>')
+  .description('Print a session\'s scrollback')
+  .action(async (sessionId: string) => {
+    const { CliClient } = await import('./cli-client.js');
+    const client = new CliClient(loadConfig());
+    try {
+      await client.connect();
+      process.stdout.write(await client.attachWithScrollback(sessionId));
+      client.detach(sessionId);
+    } finally {
+      client.close();
+    }
+  });
+
+term
+  .command('send <sessionId> <text...>')
+  .description('Send input to a session (appends Enter unless --no-enter)')
+  .option('--no-enter', 'Do not append a newline to the input')
+  .action(async (sessionId: string, text: string[], opts: { enter: boolean }) => {
+    const { CliClient } = await import('./cli-client.js');
+    const client = new CliClient(loadConfig());
+    try {
+      await client.connect();
+      const data = text.join(' ') + (opts.enter ? '\n' : '');
+      client.sendInput(sessionId, data);
+      // Give the input a moment to flush before closing the socket.
+      await new Promise((r) => setTimeout(r, 300));
+      console.log('sent.');
+    } finally {
+      client.close();
+    }
+  });
+
+term
+  .command('follow <sessionId>')
+  .description('Stream a session\'s output live (Ctrl-C to stop)')
+  .action(async (sessionId: string) => {
+    const { CliClient } = await import('./cli-client.js');
+    const client = new CliClient(loadConfig());
+    try {
+      await client.connect();
+      // Print existing scrollback first, then follow live output.
+      process.stdout.write(await client.attachWithScrollback(sessionId));
+      const follow = setInterval(() => {
+        const out = client.drainOutput(sessionId);
+        if (out) process.stdout.write(out);
+      }, 100);
+      // Poll the socket; relay output arrives via the message handler.
+      await new Promise<void>((resolve) => {
+        process.on('SIGINT', () => { clearInterval(follow); resolve(); });
+      });
+      client.detach(sessionId);
+      process.stdout.write('\n[detached]\n');
+    } finally {
+      client.close();
+    }
+  });
+
 // ── gen-token ─────────────────────────────────────────────────────────────────
 program
   .command('gen-token')
