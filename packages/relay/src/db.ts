@@ -26,7 +26,8 @@ export interface SessionToken {
 
 function getDbPath(): string {
   const isRoot = process.getuid?.() === 0;
-  const dir = isRoot ? '/etc/airelay' : join(homedir(), '.config', 'airelay');
+  const dir = process.env.AIRELAY_CONFIG_DIR
+    ?? (isRoot ? '/etc/airelay' : join(homedir(), '.config', 'airelay'));
   mkdirSync(dir, { recursive: true });
   return join(dir, 'relay.db');
 }

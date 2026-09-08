@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [22]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build all packages
+        run: pnpm build
+
+      - name: Typecheck
+        run: |
+          for p in shared agent relay; do
+            (cd packages/$p && npx tsc --noEmit)
+          done
+          # web has pre-existing lib-type errors (SpeechRecognition) excluded;
+          # its build (vite + tsc transform) passing above is the type gate.
+
+      - name: Unit + interop tests (agent)
+        run: |
+          cd packages/agent
+          node --test test/e2e-interop.test.mjs test/binary-frames.test.mjs test/waiting-transition.test.mjs
+
+      - name: Rate limiter unit tests (relay)
+        run: |
+          cd packages/relay
+          node --test test/rate-limit.test.mjs
+
+      - name: Zero-knowledge regression test (relay, live stack)
+        run: |
+          cd packages/relay
+          # Start relay + agent with an isolated config so the test exercises
+          # the real forwarding path end to end.
+          export AIRELAY_CONFIG_DIR=$RUNNER_TEMP/airelay-config
+          mkdir -p "$AIRELAY_CONFIG_DIR"
+          HOST_SECRET=$(openssl rand -hex 32)
+          HOST_ID=$(uuidgen | tr 'A-Z' 'a-z')
+          cat > "$AIRELAY_CONFIG_DIR/config.json" <<EOF
+          {"relayUrl":"http://127.0.0.1:3000","hostId":"$HOST_ID","hostSecret":"$HOST_SECRET"}
+          EOF
+          cat > "$AIRELAY_CONFIG_DIR/agents.json" <<EOF
+          {"agents":[{"id":"claude","name":"Claude Code","type":"pty","command":"true","args":[],"icon":"🤖"}]}
+          EOF
+          node dist/index.js init
+          node dist/index.js register "$HOST_ID" "$HOST_SECRET" ci-host
+          node dist/index.js start &
+          (cd ../agent && node dist/index.js agent _run) &
+          sleep 3
+          node --test test/zero-knowledge.test.mjs

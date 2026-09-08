@@ -16,7 +16,9 @@ import { execFile as execFileCb } from 'node:child_process';
 import { promisify } from 'node:util';
 
 const execFile = promisify(execFileCb);
-const CONFIG_DIR = join(homedir(), '.config', 'airelay');
+// Config directory: AIRELAY_CONFIG_DIR overrides the default location
+// (used by tests/CI to run against an isolated config).
+const CONFIG_DIR = process.env.AIRELAY_CONFIG_DIR ?? join(homedir(), '.config', 'airelay');
 const CHUNK_SIZE = 64 * 1024; // 64 KB
 
 interface Config {

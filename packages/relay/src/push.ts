@@ -16,9 +16,10 @@ let vapidKeys: { publicKey: string; privateKey: string } | null = null;
 let configured = false;
 
 function keysPath(): string {
-  // Same directory as the relay DB (mirror of db.ts getDbPath).
+  // Same directory as the relay DB (mirrors db.ts getDbPath).
   const isRoot = process.getuid?.() === 0;
-  const dir = isRoot ? '/etc/airelay' : join(process.env.HOME ?? '', '.config', 'airelay');
+  const dir = process.env.AIRELAY_CONFIG_DIR
+    ?? (isRoot ? '/etc/airelay' : join(process.env.HOME ?? '', '.config', 'airelay'));
   return join(dir, 'vapid-keys.json');
 }
 

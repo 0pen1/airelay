@@ -245,13 +245,13 @@ cat ~/.config/airelay/sessions.json
 
 ## Security checklist
 
-- [ ] No plaintext terminal I/O in logs
-- [ ] All `data` fields encrypted when E2E active
-- [ ] Relay cannot decrypt (verify with audit log)
+- [x] No plaintext terminal I/O in logs (agent logs status only; relay audit lines are metadata-only)
+- [x] All `data` fields encrypted when E2E active (binary frames carry iv||ct raw; JSON path uses `e2e`)
+- [x] Relay cannot decrypt (no decryption code; enforced by `packages/relay/test/zero-knowledge.test.mjs`)
 - [x] Session tokens rotate on connect (in-place, 60s grace for the old value)
-- [ ] JTI prevents JWT replay
-- [ ] HMAC timestamp prevents replay (±60s)
-- [ ] Input validation on all user-controlled fields
+- [x] JTI prevents JWT replay
+- [x] HMAC timestamp prevents replay (±30s)
+- [x] Input validation on all user-controlled fields
 
 ## File organization
 

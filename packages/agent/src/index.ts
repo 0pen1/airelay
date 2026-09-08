@@ -12,7 +12,9 @@ import { install, uninstall, isRunning } from './launchd.js';
 import { execSync } from 'node:child_process';
 import * as qrcode from 'qrcode-terminal';
 
-const CONFIG_DIR = join(homedir(), '.config', 'airelay');
+// Config directory: AIRELAY_CONFIG_DIR overrides the default location
+// (used by tests/CI to run against an isolated config).
+const CONFIG_DIR = process.env.AIRELAY_CONFIG_DIR ?? join(homedir(), '.config', 'airelay');
 const CONFIG_FILE = join(CONFIG_DIR, 'config.json');
 const AGENTS_FILE = join(CONFIG_DIR, 'agents.json');
 

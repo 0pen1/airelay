@@ -12,6 +12,7 @@ import {
   deletePushSubscription,
 } from './db.js';
 import { initPush, getVapidPublicKey, sendPush } from './push.js';
+import { allow, startSweep } from './rate-limit.js';
 
 // ESM: derive the directory of this module (was __dirname under CJS)
 const __dirname = join(fileURLToPath(import.meta.url), '..');
@@ -72,6 +73,9 @@ export function createRelayServer(port: number): void {
 
   // Periodic cleanup of expired JTIs and token-grace aliases (1/hour).
   setInterval(cleanExpiredJtis, 3600_000).unref();
+
+  // Rate-limiter housekeeping (drop stale per-IP buckets every 5 min).
+  startSweep();
 
   // ── Web Push (VAPID) ─────────────────────────────────────────────────────────
   // Subscriptions are authorized with the client's session token; pushes carry
@@ -141,7 +145,23 @@ export function createRelayServer(port: number): void {
 
   // Process-lifetime counters + current connection gauge. Host-id metadata
   // only — no message contents, keeping the zero-knowledge posture.
-  app.get('/metrics', (_req, res) => {
+  // Set AIRELAY_METRICS_TOKEN to require `Authorization: Bearer <token>`;
+  // without it, only loopback clients may read metrics (a public deployment
+  // must set the token).
+  app.get('/metrics', (req, res) => {
+    const required = process.env.AIRELAY_METRICS_TOKEN;
+    if (required) {
+      if (req.headers['authorization'] !== `Bearer ${required}`) {
+        res.status(401).json({ error: 'unauthorized' });
+        return;
+      }
+    } else {
+      const ip = req.socket.remoteAddress ?? '';
+      if (ip !== '127.0.0.1' && ip !== '::1' && ip !== '::ffff:127.0.0.1') {
+        res.status(401).json({ error: 'metrics requires AIRELAY_METRICS_TOKEN' });
+        return;
+      }
+    }
     res.json({
       uptime_seconds: Math.floor(Date.now() / 1000) - metrics.startedAt,
       connections: {
@@ -302,10 +322,24 @@ export function createRelayServer(port: number): void {
       let authed = false;
       let hostId = '';
       let connId = '';
+      const clientIp = req.socket.remoteAddress ?? 'unknown';
 
       const authTimeout = setTimeout(() => {
         if (!authed) ws.close(4001, 'Auth timeout');
       }, 10_000);
+
+      // Per-IP cap on auth attempts (successes count too — one device barely
+      // dents it, a token-guessing loop exhausts it).
+      if (!allow(`auth:${clientIp}`, 30, 60_000)) {
+        ws.close(4008, 'Too many auth attempts');
+        return;
+      }
+
+      // Authenticated message cap: a single connection cannot flood the relay
+      // (protects the agent socket and forwarding fan-out).
+      let messageBudgetReset = Date.now();
+      let messageCount = 0;
+      const MESSAGES_PER_SECOND = 200;
 
       ws.on('message', async (data, isBinary) => {
         if (!authed) {
@@ -352,10 +386,10 @@ export function createRelayServer(port: number): void {
             );
             if (!jwtResult) {
               metrics.authFailures++;
-              // Send an explicit AUTH_FAILED before the 4001 close so the client
-              // can distinguish "token expired/invalid — re-scan" from a
-              // transient disconnect and stop its reconnect loop. (The client
-              // keys off the 4001 close code; this message is for clarity/UI.)
+              // Each auth failure eats 5 slots from the per-IP budget
+              // (honest clients fail at most once; attackers burn their quota
+              // fast).
+              for (let i = 0; i < 4; i++) allow(`auth:${clientIp}`, 30, 60_000);
               sendJson(ws, { type: 'error', code: 'AUTH_FAILED', message: 'Token expired or invalid' });
               ws.close(4001, 'Unauthorized');
               return;
@@ -389,6 +423,18 @@ export function createRelayServer(port: number): void {
         // (terminal I/O) pass through as binary; text frames are re-sent as
         // text (Buffer would go out as a binary frame and break the agent's
         // JSON path / isBinary discrimination).
+
+        // Per-connection rate cap: drop (not close) excess messages. A human
+        // typing + terminal echo rarely exceeds 50 msg/s; 200 absorbs bursts
+        // (e.g. pasting a long command). A sustained flood is a DoS attempt.
+        const now = Date.now();
+        if (now - messageBudgetReset >= 1000) {
+          messageBudgetReset = now;
+          messageCount = 0;
+        }
+        messageCount++;
+        if (messageCount > MESSAGES_PER_SECOND) return; // drop
+
         metrics.messagesClientToAgent++;
         metrics.bytesClientToAgent += (data as Buffer).length;
         audit('client->agent', data as Buffer, isBinary, hostId);
