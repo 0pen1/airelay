@@ -6,33 +6,51 @@ import { validateSessionId } from '@airelay/shared';
 const execFile = promisify(execFileCb);
 
 /**
- * tmux control mode escapes non-printable bytes in %output data as octal \ooo.
- * Decode them back to their original characters.
+ * tmux control mode escapes non-printable BYTES in %output data as 3-digit
+ * octal (\ooo), but passes high bytes (≥ 0x80) through RAW — a CJK character
+ * arrives as its literal UTF-8 bytes right next to \ooo escapes on the SAME
+ * line (verified against tmux 3.7c: `\033[32m` + raw E7BBBF… + `\015\012`).
+ *
+ * After the byte-level line splitter decodes the line as UTF-8, the payload
+ * is a string interleaving two kinds of runs:
+ *   • \ooo escapes — one raw byte each
+ *   • literal text — UTF-8, possibly multi-byte
+ * Re-encode literal runs as UTF-8 bytes (charCodeAt would truncate a
+ * multi-byte char to its low byte: 你 U+4F60 → 0x60 '`' — the mojibake that
+ * garbled every coloured CJK line), splice in the escaped bytes, then decode
+ * the assembled byte stream as UTF-8.
  */
-/**
- * tmux control mode escapes non-printable bytes in %output data as octal \ooo.
- * Decode them back. IMPORTANT: tmux escapes *bytes*, and non-ASCII UTF-8
- * characters arrive as several consecutive escapes (你 = \344\275\240).
- * Decoding byte-by-byte with String.fromCharCode yields Latin-1 mojibake;
- * instead, build a byte array first, then decode the whole run as UTF-8.
- */
-function unescapeTmux(s: string): string {
-  if (!s.includes('\\')) return s; // fast path: nothing to unescape
-  const bytes: number[] = [];
-  let i = 0;
-  while (i < s.length) {
-    const m = /^\\([0-7]{3})/.exec(s.slice(i, i + 4));
-    if (m) {
-      bytes.push(parseInt(m[1], 8));
-      i += 4;
-    } else {
-      // Escape sequences only appear for non-printable bytes; printable
-      // characters here are single-byte ASCII (the line is Latin-1-safe).
-      bytes.push(s.charCodeAt(i));
-      i += 1;
-    }
+export function unescapeTmux(s: string): string {
+  if (!s.includes('\\')) return s; // fast path: pure text, already valid UTF-8
+  const parts: Buffer[] = [];
+  const re = /\\([0-7]{3})/g;
+  let last = 0;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(s)) !== null) {
+    if (m.index > last) parts.push(Buffer.from(s.slice(last, m.index), 'utf8'));
+    parts.push(Buffer.from([parseInt(m[1], 8)]));
+    last = m.index + m[0].length;
   }
-  return Buffer.from(bytes).toString('utf8');
+  if (last < s.length) parts.push(Buffer.from(s.slice(last), 'utf8'));
+  return Buffer.concat(parts).toString('utf8');
+}
+
+/**
+ * Append a raw pipe chunk to `buf` and cut complete lines. Pipe chunks split
+ * at arbitrary BYTE offsets; buffering raw bytes and cutting only at 0x0A
+ * (a byte that can never appear inside a multi-byte UTF-8 sequence) keeps
+ * multi-byte characters intact across chunk boundaries.
+ */
+export function extractLines(buf: Buffer, chunk: Buffer): { lines: string[]; rest: Buffer } {
+  const all = buf.length === 0 ? chunk : Buffer.concat([buf, chunk]);
+  const lines: string[] = [];
+  let start = 0;
+  let nl: number;
+  while ((nl = all.indexOf(0x0a, start)) !== -1) {
+    lines.push(all.subarray(start, nl).toString('utf8'));
+    start = nl + 1;
+  }
+  return { lines, rest: all.subarray(start) };
 }
 
 /**
@@ -178,18 +196,12 @@ export class PtyDriver implements AgentDriver {
 
     this.controlProcs.set(sessionId, proc);
 
-    // Byte-level line buffer: pipe chunks split at arbitrary byte offsets,
-    // and a split landing mid-UTF-8-character would permanently corrupt it
-    // if we called chunk.toString() per chunk (U+FFFD replacement). Buffer
-    // raw bytes, cut complete lines at 0x0A (a byte that can never appear
-    // inside a multi-byte UTF-8 sequence), and only then decode.
+    // Byte-level line buffer — see extractLines for why raw bytes, not strings.
     let lineBuf = Buffer.alloc(0);
     proc.stdout.on('data', (chunk: Buffer) => {
-      lineBuf = Buffer.concat([lineBuf, chunk]);
-      let nl: number;
-      while ((nl = lineBuf.indexOf(0x0a)) !== -1) {
-        const line = lineBuf.subarray(0, nl).toString('utf8');
-        lineBuf = lineBuf.subarray(nl + 1);
+      const { lines, rest } = extractLines(lineBuf, chunk);
+      lineBuf = rest;
+      for (const line of lines) {
         if (line.startsWith('%output ')) {
           // Format: %output %<pane-id> <octal-escaped data>
           const afterPane = line.indexOf(' ', 8);
