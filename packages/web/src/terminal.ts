@@ -250,6 +250,13 @@ export function mountTerminal(app: HTMLElement, sessionId: string): () => void {
   });
 
   // ── message handler ───────────────────────────────────────────────────────
+  // Set when a reconnect re-attaches: the next completed scrollback replay
+  // must RESET the terminal first. xterm keeps its own buffer across socket
+  // reconnects; appending fresh scrollback after one would leave stale or
+  // corrupted lines (e.g. output garbled before a daemon-side fix) on
+  // screen forever. Server scrollback is the source of truth.
+  let resetOnNextScrollback = false;
+
   const off = wsManager.on((msg) => {
     if (msg['type'] === 'output' && msg['session_id'] === sessionId) {
       term.write(msg['data'] as string);
@@ -257,6 +264,10 @@ export function mountTerminal(app: HTMLElement, sessionId: string): () => void {
       const seq = msg['seq'] as number;
       scrollbackChunks.set(seq, msg['data'] as string);
       if (msg['done'] as boolean) {
+        if (resetOnNextScrollback) {
+          resetOnNextScrollback = false;
+          term.reset();
+        }
         // Write all chunks in order
         const keys = Array.from(scrollbackChunks.keys()).sort((a, b) => a - b);
         for (const k of keys) term.write(scrollbackChunks.get(k)!);
@@ -288,7 +299,13 @@ export function mountTerminal(app: HTMLElement, sessionId: string): () => void {
     wsManager.send({ type: 'list_sessions' });
   }
   wsManager.setStatusCallback((connected) => {
-    if (connected) attachToSession();
+    // Reconnect (not the initial mount): the terminal just re-attached and
+    // will receive fresh scrollback — reset xterm's buffer so replayed
+    // scrollback replaces whatever was on screen, not appends to it.
+    if (connected) {
+      resetOnNextScrollback = true;
+      attachToSession();
+    }
   });
   attachToSession();
 
