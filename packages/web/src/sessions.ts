@@ -228,6 +228,15 @@ export function mountSessions(app: HTMLElement): () => void {
     if (connected) requestSessions();
   }
 
+  // Refresh the latency chip once a probe cycle has had a chance to run.
+  // Shows "· 123ms" next to Connected so dead/slow links are visible at a glance.
+  const latencyTimerId = setInterval(() => {
+    const rtt = wsManager.latencyMs;
+    if (rtt > 0) {
+      connStatus.lastChild!.textContent = `Connected · ${rtt}ms`;
+    }
+  }, 5_000);
+
   function requestSessions(): void {
     wsManager.send({ type: 'list_sessions' });
   }
@@ -384,6 +393,7 @@ export function mountSessions(app: HTMLElement): () => void {
 
   return () => {
     off();
+    clearInterval(latencyTimerId);
     clearTimeout(retryTimer);
     // Drop our status callback so a later (re)connect doesn't fire
     // requestSessions against a stale DOM after we've unmounted.

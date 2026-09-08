@@ -9,6 +9,7 @@
 import { BinaryOpcode, decodeBinaryFrame, encodeBinaryFrame } from '@airelay/shared';
 import { E2eSession, type E2ePayload } from './e2e.js';
 import { setupPushSubscription } from './notify.js';
+import { showToast } from './toast.js';
 
 export type MessageHandler = (msg: Record<string, unknown>) => void;
 
@@ -50,6 +51,14 @@ export class WSManager {
   // ── Binary frame state ──────────────────────────────────────────────────
   // slot → session_id, learned from `attached` messages. Empty = JSON-only.
   private slots = new Map<number, string>();
+
+  // ── Latency probe state ─────────────────────────────────────────────────
+  private latencyTimer: ReturnType<typeof setInterval> | null = null;
+  private latencySentAt = 0;
+  private lastRttMs = 0;
+
+  /** Last measured round-trip time to the agent (via latency probes), or 0. */
+  get latencyMs(): number { return this.lastRttMs; }
 
   setStatusCallback(cb: (connected: boolean, reconnecting: boolean) => void): void {
     this.onStatusChange = cb;
@@ -145,12 +154,27 @@ export class WSManager {
         }
       }
 
+      // Latency probe echo from the agent.
+      if (msg['type'] === 'latency_pong' && this.latencySentAt) {
+        this.lastRttMs = Date.now() - this.latencySentAt;
+        this.latencySentAt = 0;
+        return;
+      }
+
       // E2E handshake response from agent
       if (msg['type'] === 'e2e_ack' && this.e2eSession) {
         this.e2eSession.handleAck(msg as { pub: string; sig: string }).then((ok) => {
           if (!ok) console.warn('E2E handshake failed — sig verification error');
         });
         return; // don't forward handshake messages to UI handlers
+      }
+
+      // Protocol errors (session occupied, agent unavailable, …) surface as
+      // toasts. AUTH_FAILED is handled by the close-code path (re-scan UI),
+      // so it's skipped here to avoid double reporting.
+      if (msg['type'] === 'error' && msg['code'] !== 'AUTH_FAILED') {
+        showToast(String(msg['message'] ?? 'Something went wrong'));
+        // fall through: handlers may still want the error message
       }
 
       // Transparent E2E decryption: if the message has an `e2e` field, decrypt
@@ -175,6 +199,7 @@ export class WSManager {
       this.ws = null;
       this.e2eSession = null; // E2E state dies with the connection
       this.slots.clear();     // slot assignments die with the connection
+      if (this.latencyTimer) { clearInterval(this.latencyTimer); this.latencyTimer = null; }
       if (ev.code === 4001) {
         this.onStatusChange(false, false);
         this.onAuthFail();
@@ -188,6 +213,15 @@ export class WSManager {
     };
 
     ws.onerror = () => { /* handled by onclose */ };
+
+    // Latency probe: browsers can't read WS ping/pong frames, so use a JSON
+    // round-trip. The agent echoes latency_probe back (see daemon.ts); RTT
+    // covers relay + agent, which is the latency the user actually feels.
+    this.latencyTimer = setInterval(() => {
+      if (this.ws?.readyState !== WebSocket.OPEN) return;
+      this.latencySentAt = Date.now();
+      this.ws.send(JSON.stringify({ type: 'latency_probe', t: this.latencySentAt }));
+    }, 15_000);
   }
 
   /**

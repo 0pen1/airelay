@@ -32,10 +32,39 @@ interface ClientConn {
 const agents = new Map<string, AgentConn>();           // hostId → conn
 const clients = new Map<string, ClientConn>();         // connId → conn
 
+// ── Counters (process-lifetime, exposed via /metrics) ─────────────────────────
+const metrics = {
+  startedAt: Math.floor(Date.now() / 1000),
+  agentConnections: 0,       // agent WS connects (including reconnects)
+  clientConnections: 0,      // successful client auths
+  authFailures: 0,           // rejected auths (bad JWT/token)
+  messagesAgentToClient: 0,  // forwarded frames
+  messagesClientToAgent: 0,
+  bytesAgentToClient: 0,
+  bytesClientToAgent: 0,
+  binaryFrames: 0,           // binary (terminal I/O) frames seen
+  pushesSent: 0,             // successful web-push deliveries
+  pushFailures: 0,
+};
+
 function sendJson(ws: WebSocket, obj: unknown): void {
   if (ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify(obj));
   }
+}
+
+/** Metadata-only audit line: direction, message type (if parseable), size.
+ *  Never logs payload contents — preserves the zero-knowledge guarantee while
+ *  giving operators a trace of what flowed through the relay. */
+function audit(dir: 'agent->client' | 'client->agent', data: Buffer, isBinary: boolean, hostId: string): void {
+  let type = isBinary ? 'binary' : '?';
+  if (!isBinary) {
+    try {
+      const parsed = JSON.parse(data.toString()) as { type?: string };
+      type = parsed.type ?? '?';
+    } catch { /* keep '?' */ }
+  }
+  console.log(`[AUDIT ${new Date().toISOString()}] ${dir} host=${hostId} type=${type} bytes=${data.length}`);
 }
 
 export function createRelayServer(port: number): void {
@@ -94,7 +123,9 @@ export function createRelayServer(port: number): void {
           { endpoint: sub.endpoint, keys: { p256dh: sub.p256dh, auth: sub.auth } },
           { title: 'airelay', body: 'Your agent is waiting for input' },
         );
+        metrics.pushesSent++;
       } catch (err) {
+        metrics.pushFailures++;
         const status = (err as { statusCode?: number }).statusCode;
         if (status === 404 || status === 410) {
           deletePushSubscription(sub.endpoint);
@@ -106,6 +137,32 @@ export function createRelayServer(port: number): void {
 
   app.get('/health', (_req, res) => {
     res.json({ ok: true, agents: agents.size, clients: clients.size });
+  });
+
+  // Process-lifetime counters + current connection gauge. Host-id metadata
+  // only — no message contents, keeping the zero-knowledge posture.
+  app.get('/metrics', (_req, res) => {
+    res.json({
+      uptime_seconds: Math.floor(Date.now() / 1000) - metrics.startedAt,
+      connections: {
+        agents_online: agents.size,
+        clients_online: clients.size,
+        agent_connects_total: metrics.agentConnections,
+        client_auths_total: metrics.clientConnections,
+        auth_failures_total: metrics.authFailures,
+      },
+      forwarding: {
+        messages_agent_to_client: metrics.messagesAgentToClient,
+        messages_client_to_agent: metrics.messagesClientToAgent,
+        bytes_agent_to_client: metrics.bytesAgentToClient,
+        bytes_client_to_agent: metrics.bytesClientToAgent,
+        binary_frames: metrics.binaryFrames,
+      },
+      push: {
+        sent: metrics.pushesSent,
+        failures: metrics.pushFailures,
+      },
+    });
   });
 
   // ── Device management API (HMAC-authenticated, host manages own devices) ────
@@ -182,11 +239,16 @@ export function createRelayServer(port: number): void {
       const existing = agents.get(hostId);
       if (existing) existing.ws.close(4000, 'Replaced by new connection');
 
+      metrics.agentConnections++;
       agents.set(hostId, { ws, hostId });
 
       ws.on('message', (data, isBinary) => {
         // Forward to all clients bound to this host. The relay is
         // zero-knowledge: it never needs to interpret payload contents.
+        metrics.messagesAgentToClient++;
+        metrics.bytesAgentToClient += (data as Buffer).length;
+        if (isBinary) metrics.binaryFrames++;
+        audit('agent->client', data as Buffer, isBinary, hostId);
         for (const client of clients.values()) {
           if (client.hostId !== hostId) continue;
           if (isBinary) {
@@ -289,6 +351,7 @@ export function createRelayServer(port: number): void {
               token, getHost, hasJti, addJti, createSessionToken, deviceName,
             );
             if (!jwtResult) {
+              metrics.authFailures++;
               // Send an explicit AUTH_FAILED before the 4001 close so the client
               // can distinguish "token expired/invalid — re-scan" from a
               // transient disconnect and stop its reconnect loop. (The client
@@ -310,6 +373,7 @@ export function createRelayServer(port: number): void {
 
           authed = true;
           clearTimeout(authTimeout);
+          metrics.clientConnections++;
           connId = randomUUID();
           clients.set(connId, { ws, hostId, connId });
           // Tell the client the connection is now authenticated and ready.
@@ -325,6 +389,9 @@ export function createRelayServer(port: number): void {
         // (terminal I/O) pass through as binary; text frames are re-sent as
         // text (Buffer would go out as a binary frame and break the agent's
         // JSON path / isBinary discrimination).
+        metrics.messagesClientToAgent++;
+        metrics.bytesClientToAgent += (data as Buffer).length;
+        audit('client->agent', data as Buffer, isBinary, hostId);
         const agentConn = agents.get(hostId);
         if (!agentConn) {
           sendJson(ws, { type: 'error', code: 'AGENT_OFFLINE', message: 'Host agent disconnected' });

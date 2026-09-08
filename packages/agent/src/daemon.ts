@@ -309,6 +309,12 @@ export function startDaemon(): void {
   async function handleMessage(msg: Record<string, unknown>, _ws: WebSocket): Promise<void> {
     const type = msg['type'] as string;
 
+    // ── Latency probe echo (no state, no logging) ─────────────────────────
+    if (type === 'latency_probe') {
+      send({ type: 'latency_pong', t: msg['t'] });
+      return;
+    }
+
     // ── E2E handshake ─────────────────────────────────────────────────────
     if (type === 'e2e_hello') {
       const session = new E2eSession(e2eSecret);
