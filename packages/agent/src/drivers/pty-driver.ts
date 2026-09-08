@@ -9,8 +9,30 @@ const execFile = promisify(execFileCb);
  * tmux control mode escapes non-printable bytes in %output data as octal \ooo.
  * Decode them back to their original characters.
  */
+/**
+ * tmux control mode escapes non-printable bytes in %output data as octal \ooo.
+ * Decode them back. IMPORTANT: tmux escapes *bytes*, and non-ASCII UTF-8
+ * characters arrive as several consecutive escapes (你 = \344\275\240).
+ * Decoding byte-by-byte with String.fromCharCode yields Latin-1 mojibake;
+ * instead, build a byte array first, then decode the whole run as UTF-8.
+ */
 function unescapeTmux(s: string): string {
-  return s.replace(/\\([0-7]{3})/g, (_m, oct) => String.fromCharCode(parseInt(oct, 8)));
+  if (!s.includes('\\')) return s; // fast path: nothing to unescape
+  const bytes: number[] = [];
+  let i = 0;
+  while (i < s.length) {
+    const m = /^\\([0-7]{3})/.exec(s.slice(i, i + 4));
+    if (m) {
+      bytes.push(parseInt(m[1], 8));
+      i += 4;
+    } else {
+      // Escape sequences only appear for non-printable bytes; printable
+      // characters here are single-byte ASCII (the line is Latin-1-safe).
+      bytes.push(s.charCodeAt(i));
+      i += 1;
+    }
+  }
+  return Buffer.from(bytes).toString('utf8');
 }
 
 /**

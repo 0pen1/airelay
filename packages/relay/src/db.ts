@@ -104,6 +104,20 @@ export function getDb(): DatabaseSync {
       "UPDATE session_tokens SET device_id = hex(randomblob(16)) WHERE device_id = ''",
     );
   }
+  // token_grace schema change: older DBs have (token, host_id, expires_at);
+  // the grace lookup now targets a stable device_id. Rebuild if the old
+  // shape is detected — grace aliases are ephemeral (≤60s), so dropping
+  // them loses nothing.
+  const graceCols = getDb().prepare('PRAGMA table_info(token_grace)').all() as Array<{ name: string }>;
+  const graceColNames = new Set(graceCols.map((c) => c.name));
+  if (graceColNames.has('host_id') && !graceColNames.has('device_id')) {
+    getDb().exec('DROP TABLE token_grace');
+    getDb().exec(`CREATE TABLE token_grace (
+      token      TEXT PRIMARY KEY,
+      device_id  TEXT NOT NULL,
+      expires_at INTEGER NOT NULL
+    )`);
+  }
   return _db;
 }
 

@@ -40,7 +40,7 @@ jobs:
       - name: Unit + interop tests (agent)
         run: |
           cd packages/agent
-          node --test test/e2e-interop.test.mjs test/binary-frames.test.mjs test/waiting-transition.test.mjs
+          node --test test/e2e-interop.test.mjs test/binary-frames.test.mjs test/waiting-transition.test.mjs test/tmux-unescape.test.mjs
 
       - name: Rate limiter unit tests (relay)
         run: |

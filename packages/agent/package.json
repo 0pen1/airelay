@@ -7,7 +7,7 @@
     "build": "tsc",
     "dev": "tsx watch src/index.ts",
     "start": "node dist/index.js",
-    "test": "node --test test/e2e-interop.test.mjs test/binary-frames.test.mjs test/waiting-transition.test.mjs"
+    "test": "node --test test/e2e-interop.test.mjs test/binary-frames.test.mjs test/waiting-transition.test.mjs test/tmux-unescape.test.mjs"
   },
   "dependencies": {
     "@airelay/shared": "workspace:*",
