@@ -96,6 +96,9 @@ export interface SessionCreatedMsg {
 export interface AttachedMsg {
   type: 'attached';
   session_id: string;
+  /** Binary-frame slot for this session. Omitted = agent is binary-legacy
+   *  (all I/O stays on JSON). Present = client may use binary frames. */
+  slot?: number;
 }
 
 export interface ScrollbackMsg {
@@ -211,4 +214,43 @@ export type AgentDriverConfig = PtyDriverConfig | BrowserDriverConfig;
 
 export interface AgentsConfig {
   agents: AgentDriverConfig[];
+}
+
+// ── Binary frames (terminal I/O hot path) ───────────────────────────────────
+//
+// Terminal output/input travels as binary WebSocket frames instead of JSON
+// text. A frame is: [0]=opcode, [1]=slot, [2..]=payload. The slot maps to a
+// session via the `slot` field the agent puts on the `attached` message.
+// Payload is raw UTF-8 terminal bytes, or — when E2E is active —
+// [iv(12) || ciphertext||tag(16)] exactly like E2ePayload but in binary.
+
+/** Binary frame opcodes for terminal I/O. */
+export const BinaryOpcode = {
+  OUTPUT: 0x01, // agent → client
+  INPUT: 0x02,  // client → agent
+} as const;
+
+export interface BinaryFrame {
+  opcode: number;
+  slot: number;
+  payload: Uint8Array;
+}
+
+/** Encode a terminal binary frame (2-byte header + payload). */
+export function encodeBinaryFrame(opcode: number, slot: number, payload: Uint8Array): Uint8Array {
+  const out = new Uint8Array(2 + payload.length);
+  out[0] = opcode;
+  out[1] = slot;
+  out.set(payload, 2);
+  return out;
+}
+
+/** Decode a terminal binary frame. Returns null if malformed (too short). */
+export function decodeBinaryFrame(data: Uint8Array): BinaryFrame | null {
+  if (data.length < 2) return null;
+  return {
+    opcode: data[0],
+    slot: data[1],
+    payload: data.slice(2),
+  };
 }

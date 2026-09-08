@@ -1,6 +1,12 @@
 // WebSocket manager with auto-reconnect, session_token persistence,
 // and optional E2E encryption (ECDH + AES-256-GCM).
+//
+// Terminal I/O hot path uses binary frames [opcode][slot][payload] (see
+// shared/protocol.ts). The agent assigns a slot per session in its `attached`
+// message; JSON is the fallback for everything else (attach, resize, status…)
+// and whenever no slot is known.
 
+import { BinaryOpcode, decodeBinaryFrame, encodeBinaryFrame } from '@airelay/shared';
 import { E2eSession, type E2ePayload } from './e2e.js';
 
 export type MessageHandler = (msg: Record<string, unknown>) => void;
@@ -18,6 +24,10 @@ export class WSManager {
   // ── E2E state ───────────────────────────────────────────────────────────
   private e2eSecret: string | null = null; // hex, from HostEntry; null = no E2E
   private e2eSession: E2eSession | null = null;
+
+  // ── Binary frame state ──────────────────────────────────────────────────
+  // slot → session_id, learned from `attached` messages. Empty = JSON-only.
+  private slots = new Map<number, string>();
 
   setStatusCallback(cb: (connected: boolean, reconnecting: boolean) => void): void {
     this.onStatusChange = cb;
@@ -57,6 +67,8 @@ export class WSManager {
     }
 
     const ws = new WebSocket(this.url);
+    // Terminal I/O arrives as binary frames; JSON control messages as text.
+    ws.binaryType = 'arraybuffer';
     this.ws = ws;
 
     ws.onopen = () => {
@@ -65,6 +77,12 @@ export class WSManager {
     };
 
     ws.onmessage = (ev) => {
+      // ── Binary frame path ────────────────────────────────────────────────
+      if (ev.data instanceof ArrayBuffer) {
+        this.handleBinary(new Uint8Array(ev.data));
+        return;
+      }
+
       let msg: Record<string, unknown>;
       try {
         msg = JSON.parse(ev.data as string);
@@ -85,6 +103,16 @@ export class WSManager {
           this.initiateE2eHandshake();
         }
         return;
+      }
+
+      // Learn the binary-frame slot the agent assigned to this session.
+      // Re-attach to the same session keeps its slot; a fresh attach gets a
+      // new one (the agent frees old slots on detach).
+      if (msg['type'] === 'attached') {
+        const slot = msg['slot'];
+        if (typeof slot === 'number' && typeof msg['session_id'] === 'string') {
+          this.slots.set(slot, msg['session_id'] as string);
+        }
       }
 
       // E2E handshake response from agent
@@ -116,6 +144,7 @@ export class WSManager {
     ws.onclose = (ev: CloseEvent) => {
       this.ws = null;
       this.e2eSession = null; // E2E state dies with the connection
+      this.slots.clear();     // slot assignments die with the connection
       if (ev.code === 4001) {
         this.onStatusChange(false, false);
         this.onAuthFail();
@@ -136,21 +165,77 @@ export class WSManager {
    * data), transparently encrypt the `data` field into an `e2e` payload. All
    * other message types (attach, detach, resize, list_sessions, etc.) are sent
    * in plaintext — the relay needs their metadata for routing/cleanup.
+   *
+   * Input for a session with a known binary slot goes out as a binary frame
+   * ([0x02][slot][iv||ct or raw]) instead of JSON.
    */
   send(msg: unknown): void {
     if (this.ws?.readyState !== WebSocket.OPEN) return;
     const obj = msg as Record<string, unknown>;
-    if (obj['type'] === 'input' && typeof obj['data'] === 'string' && this.e2eSession?.isReady) {
-      // Encrypt asynchronously, then send
-      this.e2eSession.encrypt(obj['data'] as string).then((e2e) => {
-        const encrypted = { type: obj['type'], session_id: obj['session_id'], e2e };
-        if (this.ws?.readyState === WebSocket.OPEN) {
-          this.ws.send(JSON.stringify(encrypted));
-        }
-      });
-      return;
+    if (obj['type'] === 'input' && typeof obj['data'] === 'string') {
+      const slot = this.slotFor(obj['session_id'] as string | undefined);
+      if (slot !== null) {
+        this.sendBinaryInput(slot, obj['data'] as string);
+        return;
+      }
+      if (this.e2eSession?.isReady) {
+        // JSON fallback with E2E (legacy path)
+        this.e2eSession.encrypt(obj['data'] as string).then((e2e) => {
+          const encrypted = { type: obj['type'], session_id: obj['session_id'], e2e };
+          if (this.ws?.readyState === WebSocket.OPEN) {
+            this.ws.send(JSON.stringify(encrypted));
+          }
+        });
+        return;
+      }
     }
     this.ws.send(JSON.stringify(msg));
+  }
+
+  /** Find the binary slot for a session, or null if unknown. */
+  private slotFor(sessionId: string | undefined): number | null {
+    if (!sessionId) return null;
+    for (const [slot, sid] of this.slots) {
+      if (sid === sessionId) return slot;
+    }
+    return null;
+  }
+
+  /** Encode + send an input binary frame (E2E-encrypts payload if active). */
+  private sendBinaryInput(slot: number, data: string): void {
+    const plaintext = new TextEncoder().encode(data);
+    const sendFrame = (payload: Uint8Array): void => {
+      if (this.ws?.readyState !== WebSocket.OPEN) return;
+      this.ws.send(encodeBinaryFrame(BinaryOpcode.INPUT, slot, payload));
+    };
+    if (this.e2eSession?.isReady) {
+      this.e2eSession.encryptBytes(plaintext).then(sendFrame).catch(() => {
+        console.warn('E2E encryption failed, dropping input');
+      });
+    } else {
+      sendFrame(plaintext);
+    }
+  }
+
+  /** Decode an inbound binary frame and dispatch it as a normal output message. */
+  private handleBinary(frame: Uint8Array): void {
+    const decoded = decodeBinaryFrame(frame);
+    if (!decoded || decoded.opcode !== BinaryOpcode.OUTPUT) return;
+    const sessionId = this.slots.get(decoded.slot);
+    if (!sessionId) return; // unknown slot — drop
+
+    const dispatch = (plaintext: Uint8Array): void => {
+      const msg = { type: 'output', session_id: sessionId, data: new TextDecoder().decode(plaintext) };
+      for (const h of this.handlers) h(msg);
+    };
+    if (this.e2eSession?.isReady) {
+      this.e2eSession.decryptBytes(decoded.payload).then(dispatch).catch(() => {
+        // Tampered or wrong key — drop silently.
+        console.warn('E2E binary decryption failed, dropping frame');
+      });
+    } else {
+      dispatch(decoded.payload);
+    }
   }
 
   disconnect(): void {
@@ -161,6 +246,7 @@ export class WSManager {
       this.ws = null;
     }
     this.e2eSession = null;
+    this.slots.clear();
     this.onStatusChange(false, false);
   }
 

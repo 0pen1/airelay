@@ -2,11 +2,15 @@ import express from 'express';
 import { createServer } from 'node:http';
 import { WebSocketServer, WebSocket } from 'ws';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { verifyAgentAuth, verifyClientJwt, verifySessionTokenAuth } from './auth.js';
 import {
   getHost, addJti, hasJti, createSessionToken, getSessionToken,
 } from './db.js';
+
+// ESM: derive the directory of this module (was __dirname under CJS)
+const __dirname = join(fileURLToPath(import.meta.url), '..');
 
 interface AgentConn {
   ws: WebSocket;
@@ -67,19 +71,32 @@ export function createRelayServer(port: number): void {
 
       agents.set(hostId, { ws, hostId });
 
-      ws.on('message', (data) => {
-        // Forward to all clients bound to this host
-        const msg = data.toString();
+      ws.on('message', (data, isBinary) => {
+        // Forward to all clients bound to this host. The relay is
+        // zero-knowledge: it never needs to interpret payload contents.
         for (const client of clients.values()) {
-          if (client.hostId === hostId) {
-            // Track session_id for cleanup on disconnect
+          if (client.hostId !== hostId) continue;
+          if (isBinary) {
+            // Binary frames (terminal I/O) pass through untouched —
+            // decoding/encoding here would corrupt them.
+            if (client.ws.readyState === WebSocket.OPEN) {
+              client.ws.send(data, { binary: true });
+            }
+          } else {
+            // Text frames are JSON. Track session_id for cleanup on
+            // disconnect, then forward the string as-is (no parse→
+            // stringify roundtrip). Parse errors are tolerated: the
+            // message still gets forwarded.
+            const msg = data.toString();
             try {
-              const parsed = JSON.parse(msg);
+              const parsed = JSON.parse(msg) as { type?: string; session_id?: string };
               if (parsed.type === 'session_created' || parsed.type === 'attached') {
                 client.sessionId = parsed.session_id;
               }
-            } catch { /* ignore parse errors */ }
-            sendJson(client.ws, JSON.parse(msg));
+            } catch { /* not JSON — forward anyway */ }
+            if (client.ws.readyState === WebSocket.OPEN) {
+              client.ws.send(msg);
+            }
           }
         }
       });
@@ -110,8 +127,14 @@ export function createRelayServer(port: number): void {
         if (!authed) ws.close(4001, 'Auth timeout');
       }, 10_000);
 
-      ws.on('message', async (data) => {
+      ws.on('message', async (data, isBinary) => {
         if (!authed) {
+          if (isBinary) {
+            // Auth must be a JSON text frame
+            sendJson(ws, { type: 'error', code: 'AUTH_FAILED', message: 'Bad auth message' });
+            ws.close(4001, 'Bad auth message');
+            return;
+          }
           let msg: Record<string, unknown>;
           try {
             msg = JSON.parse(data.toString());
@@ -169,17 +192,23 @@ export function createRelayServer(port: number): void {
           return;
         }
 
-        // Authenticated: forward messages to the agent
+        // Authenticated: forward messages to the agent. Binary frames
+        // (terminal I/O) pass through as binary; text frames are re-sent as
+        // text (Buffer would go out as a binary frame and break the agent's
+        // JSON path / isBinary discrimination).
         const agentConn = agents.get(hostId);
         if (!agentConn) {
           sendJson(ws, { type: 'error', code: 'AGENT_OFFLINE', message: 'Host agent disconnected' });
           return;
         }
         if (agentConn.ws.readyState === WebSocket.OPEN) {
-          agentConn.ws.send(data);
+          if (isBinary) {
+            agentConn.ws.send(data, { binary: true });
+          } else {
+            agentConn.ws.send(data.toString(), { binary: false });
+          }
         }
       });
-
       ws.on('close', () => {
         clearTimeout(authTimeout);
         const client = clients.get(connId);

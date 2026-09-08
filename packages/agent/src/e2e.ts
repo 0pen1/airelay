@@ -91,6 +91,29 @@ export function decrypt(key: Buffer, payload: E2ePayload): string {
   return Buffer.concat([decipher.update(ct), decipher.final()]).toString('utf8');
 }
 
+// ── Raw-byte AES-256-GCM (binary frame payloads) ─────────────────────────────
+//
+// Same wire layout as E2ePayload but without base64: payload = iv(12) || ct||tag.
+// Used for terminal I/O binary frames where base64+JSON overhead is avoided.
+
+export function encryptBytes(key: Buffer, plaintext: Uint8Array): Uint8Array {
+  const iv = randomBytes(12);
+  const cipher = createCipheriv('aes-256-gcm', key, iv);
+  const ct = Buffer.concat([cipher.update(plaintext), cipher.final()]);
+  return Buffer.concat([iv, ct, cipher.getAuthTag()]);
+}
+
+export function decryptBytes(key: Buffer, payload: Uint8Array): Uint8Array {
+  if (payload.length < 12 + 16) throw new Error('E2E payload too short');
+  const iv = payload.subarray(0, 12);
+  const combined = payload.subarray(12);
+  const ct = combined.subarray(0, combined.length - 16);
+  const tag = combined.subarray(combined.length - 16);
+  const decipher = createDecipheriv('aes-256-gcm', key, iv);
+  decipher.setAuthTag(tag);
+  return Buffer.concat([decipher.update(ct), decipher.final()]);
+}
+
 // ── E2eSession — manages handshake state + encrypt/decrypt (agent side) ──────
 
 export type E2eState = 'idle' | 'ready';
@@ -128,5 +151,17 @@ export class E2eSession {
   decrypt(payload: E2ePayload): string {
     if (!this.sessionKey) throw new Error('E2E session not ready');
     return decrypt(this.sessionKey, payload);
+  }
+
+  /** Encrypt raw bytes for a binary frame: returns iv(12) || ct||tag. */
+  encryptBytes(plaintext: Uint8Array): Uint8Array {
+    if (!this.sessionKey) throw new Error('E2E session not ready');
+    return encryptBytes(this.sessionKey, plaintext);
+  }
+
+  /** Decrypt a binary frame payload: input is iv(12) || ct||tag. */
+  decryptBytes(payload: Uint8Array): Uint8Array {
+    if (!this.sessionKey) throw new Error('E2E session not ready');
+    return decryptBytes(this.sessionKey, payload);
   }
 }

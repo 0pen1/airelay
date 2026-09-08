@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { createHmac } from 'node:crypto';
-import { signHmac, validateSessionId, validateAgentId } from '@airelay/shared';
+import { signHmac, validateSessionId, validateAgentId, encodeBinaryFrame, BinaryOpcode } from '@airelay/shared';
 import type {
   ClientToAgentMsg, AgentDriverConfig, PtyDriverConfig,
   AgentTypeInfo, SessionInfo, ErrorCode,
@@ -90,6 +90,58 @@ export function startDaemon(): void {
   // or clicking a session from the list) would find no live callback to
   // forward tmux output to the client — the terminal would freeze.
   const subs = new Map<string, Disposable[]>();
+
+  // ── Binary frame slots ──────────────────────────────────────────────────────
+  // Terminal I/O hot path uses binary frames [opcode][slot][payload]. Slots are
+  // assigned on attach and announced via the `slot` field on `attached`. The
+  // client falls back to JSON when `attached` carries no slot (legacy agent).
+  const MAX_SLOT = 255;
+  const sessionSlots = new Map<string, number>();  // sessionId → slot
+  const slotSessions = new Map<number, string>();  // slot → sessionId
+  let nextSlot = 0;
+
+  function allocateSlot(sessionId: string): number {
+    // Reuse a slot if this session already has one (re-attach).
+    const existing = sessionSlots.get(sessionId);
+    if (existing !== undefined) return existing;
+    // Reclaim slots from sessions without live subscriptions when full.
+    if (slotSessions.size > MAX_SLOT) {
+      for (const [sid, slot] of sessionSlots) {
+        if (!subs.has(sid)) {
+          sessionSlots.delete(sid);
+          slotSessions.delete(slot);
+        }
+      }
+    }
+    // Linear probe for a free slot (single client → almost always first try).
+    let slot = nextSlot;
+    for (let i = 0; i <= MAX_SLOT; i++) {
+      if (!slotSessions.has(slot)) break;
+      slot = (slot + 1) % (MAX_SLOT + 1);
+    }
+    nextSlot = (slot + 1) % (MAX_SLOT + 1);
+    sessionSlots.set(sessionId, slot);
+    slotSessions.set(slot, sessionId);
+    return slot;
+  }
+
+  function freeSlot(sessionId: string): void {
+    const slot = sessionSlots.get(sessionId);
+    if (slot !== undefined) {
+      slotSessions.delete(slot);
+      sessionSlots.delete(sessionId);
+    }
+  }
+
+  /** Send a binary output frame for a session (E2E-encrypts payload if active). */
+  function sendBinaryOutput(sessionId: string, data: string): void {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    const slot = sessionSlots.get(sessionId);
+    if (slot === undefined) return; // no slot — caller falls back to JSON
+    const plaintext = Buffer.from(data, 'utf8');
+    const payload = e2e?.isReady ? e2e.encryptBytes(plaintext) : plaintext;
+    ws.send(encodeBinaryFrame(BinaryOpcode.OUTPUT, slot, payload), { binary: true });
+  }
 
   // ── Session activity tracking ──────────────────────────────────────────────
   // Watches every session's output independent of attach state, so the phone's
@@ -186,6 +238,8 @@ export function startDaemon(): void {
       // closed WebSocket and would never deliver output. New callbacks are
       // set up when the client re-attaches.
       for (const sid of subs.keys()) disposeSubs(sid);
+      // Slots are per-connection: the new client will get fresh ones on attach.
+      for (const sid of sessionSlots.keys()) freeSlot(sid);
       e2e = null; // old E2E session is dead
 
       // Heartbeat
@@ -195,7 +249,11 @@ export function startDaemon(): void {
       }, 30_000);
     });
 
-    ws.on('message', (data) => {
+    ws.on('message', (data, isBinary) => {
+      if (isBinary) {
+        handleBinaryFrame(new Uint8Array(data as ArrayBuffer));
+        return;
+      }
       let msg: ClientToAgentMsg & Record<string, unknown>;
       try {
         msg = JSON.parse(data.toString());
@@ -218,6 +276,29 @@ export function startDaemon(): void {
     if (ws?.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify(obj));
     }
+  }
+
+  /** Handle an inbound binary frame from the client: [opcode][slot][payload]. */
+  function handleBinaryFrame(frame: Uint8Array): void {
+    if (frame.length < 2) return;
+    const opcode = frame[0];
+    const slot = frame[1];
+    const payload = frame.subarray(2);
+    const sessionId = slotSessions.get(slot);
+    if (!sessionId) return; // unknown slot — drop
+    if (opcode === BinaryOpcode.INPUT) {
+      // Decrypt if E2E is active, then feed the terminal as UTF-8 text.
+      let bytes: Uint8Array;
+      try {
+        bytes = e2e?.isReady ? e2e.decryptBytes(payload) : payload;
+      } catch {
+        return; // tampered or wrong key — drop
+      }
+      const session = sessionManager.get(sessionId);
+      if (!session) return;
+      session.driver.sendInput(sessionId, Buffer.from(bytes).toString('utf8')).catch(() => {});
+    }
+    // Unknown opcodes are ignored (forward compatibility).
   }
 
   async function handleMessage(msg: Record<string, unknown>, _ws: WebSocket): Promise<void> {
@@ -246,6 +327,7 @@ export function startDaemon(): void {
       if (sid) {
         sessionManager.unlock(sid);
         disposeSubs(sid);
+        freeSlot(sid);
       }
       e2e = null; // E2E session dies with the client
       return;
@@ -373,6 +455,7 @@ export function startDaemon(): void {
       if (!sessionId || !validateSessionId(sessionId)) return;
       sessionManager.unlock(sessionId);
       disposeSubs(sessionId);
+      freeSlot(sessionId);
       return;
     }
   }
@@ -388,7 +471,10 @@ export function startDaemon(): void {
       return;
     }
     if (_source === 'explicit') sessionManager.lock(sessionId, 'client');
-    send({ type: 'attached', session_id: sessionId });
+    // Allocate a binary-frame slot and announce it. The client uses binary
+    // frames only when `slot` is present; otherwise it stays on JSON.
+    const slot = allocateSlot(sessionId);
+    send({ type: 'attached', session_id: sessionId, slot });
 
     // (Re)wire output/exit forwarding for this session. disposeSubs first so
     // a re-attach doesn't stack duplicate callbacks. This is what makes a
@@ -399,7 +485,11 @@ export function startDaemon(): void {
     const list: Disposable[] = [];
     list.push(
       session.driver.onOutput(sessionId, (data) => {
-        if (e2e?.isReady) {
+        // Hot path: binary frame. Falls back to JSON only if the slot was
+        // lost (defensive; allocateSlot in this function guarantees one).
+        if (sessionSlots.has(sessionId)) {
+          sendBinaryOutput(sessionId, data);
+        } else if (e2e?.isReady) {
           const payload = e2e.encrypt(data);
           send({ type: 'output', session_id: sessionId, e2e: payload });
         } else {
@@ -411,6 +501,7 @@ export function startDaemon(): void {
       session.driver.onExit(sessionId, (code) => {
         send({ type: 'session_exited', session_id: sessionId, code });
         disposeSubs(sessionId);
+        freeSlot(sessionId);
         activity.delete(sessionId);
         sessionManager.remove(sessionId).catch(() => {});
       }),

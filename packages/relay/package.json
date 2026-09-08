@@ -1,6 +1,7 @@
 {
   "name": "@airelay/relay",
   "version": "0.1.0",
+  "type": "module",
   "bin": { "airelay-relay": "dist/index.js" },
   "scripts": {
     "build": "tsc",

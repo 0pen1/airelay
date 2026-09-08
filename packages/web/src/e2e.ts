@@ -124,6 +124,28 @@ export async function decrypt(key: CryptoKey, payload: E2ePayload): Promise<stri
   return new TextDecoder().decode(pt);
 }
 
+// ── Raw-byte AES-256-GCM (binary frame payloads) ─────────────────────────────
+//
+// Same wire layout as E2ePayload but without base64: payload = iv(12) || ct||tag.
+// Used for terminal I/O binary frames where base64+JSON overhead is avoided.
+
+export async function encryptBytes(key: CryptoKey, plaintext: Uint8Array): Promise<Uint8Array> {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, plaintext);
+  const out = new Uint8Array(12 + ct.byteLength);
+  out.set(iv, 0);
+  out.set(new Uint8Array(ct), 12);
+  return out;
+}
+
+export async function decryptBytes(key: CryptoKey, payload: Uint8Array): Promise<Uint8Array> {
+  if (payload.length < 12 + 16) throw new Error('E2E payload too short');
+  const iv = payload.slice(0, 12);
+  const ct = payload.slice(12);
+  const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, ct);
+  return new Uint8Array(pt);
+}
+
 // ── E2eSession — manages handshake state + encrypt/decrypt ───────────────────
 
 export type E2eState = 'idle' | 'hello_sent' | 'ready';
@@ -168,5 +190,17 @@ export class E2eSession {
   async decrypt(payload: E2ePayload): Promise<string> {
     if (!this.sessionKey) throw new Error('E2E session not ready');
     return decrypt(this.sessionKey, payload);
+  }
+
+  /** Encrypt raw bytes for a binary frame: returns iv(12) || ct||tag. */
+  async encryptBytes(plaintext: Uint8Array): Promise<Uint8Array> {
+    if (!this.sessionKey) throw new Error('E2E session not ready');
+    return encryptBytes(this.sessionKey, plaintext);
+  }
+
+  /** Decrypt a binary frame payload: input is iv(12) || ct||tag. */
+  async decryptBytes(payload: Uint8Array): Promise<Uint8Array> {
+    if (!this.sessionKey) throw new Error('E2E session not ready');
+    return decryptBytes(this.sessionKey, payload);
   }
 }
