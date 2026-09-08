@@ -138,6 +138,78 @@ agent
     startDaemon();
   });
 
+// ── devices ──────────────────────────────────────────────────────────────────
+// Manage paired devices (session tokens) via the relay's management API.
+// Authenticated with the same HMAC header the daemon uses for its WS.
+
+interface DeviceInfo {
+  id: string;
+  device_name: string;
+  created_at: number;
+  last_used_at: number;
+  expires_at: number;
+  expired: boolean;
+  status: string;
+}
+
+async function relayApi(pathname: string, init?: RequestInit): Promise<Response> {
+  const config = loadConfig();
+  const ts = Math.floor(Date.now() / 1000);
+  const sig = createHmac('sha256', config.hostSecret).update(`${config.hostId}:${ts}`).digest('hex');
+  return fetch(`${config.relayUrl}${pathname}`, {
+    ...init,
+    headers: {
+      Authorization: `HMAC host_id=${config.hostId}, ts=${ts}, sig=${sig}`,
+      ...(init?.headers ?? {}),
+    },
+  });
+}
+
+function formatUnix(ts: number): string {
+  return ts > 0 ? new Date(ts * 1000).toISOString().replace('T', ' ').slice(0, 16) : '—';
+}
+
+const devices = program.command('devices').description('Manage paired devices');
+
+devices
+  .command('list')
+  .description('List devices (session tokens) registered at the relay')
+  .action(async () => {
+    const res = await relayApi('/api/devices');
+    if (!res.ok) {
+      console.error(`Relay returned ${res.status} ${res.statusText}`);
+      process.exit(1);
+    }
+    const { devices: list } = (await res.json()) as { devices: DeviceInfo[] };
+    if (list.length === 0) {
+      console.log('No devices. Scan the QR code from `airelay gen-token` to pair one.');
+      return;
+    }
+    console.log('Devices (token prefix — name — status — last used):');
+    console.log('─'.repeat(64));
+    for (const d of list) {
+      const status = d.status === 'revoked' ? 'revoked' : d.expired ? 'expired' : 'active';
+      console.log(`  ${d.id}  ${d.device_name.padEnd(20)}  ${status.padEnd(8)}  ${formatUnix(d.last_used_at)}`);
+    }
+  });
+
+devices
+  .command('revoke <id>')
+  .description('Revoke a device by its token prefix (see devices list)')
+  .action(async (id: string) => {
+    const res = await relayApi('/api/devices/revoke', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id }),
+    });
+    if (!res.ok) {
+      console.error(`Relay returned ${res.status} ${res.statusText}`);
+      process.exit(1);
+    }
+    const { revoked } = (await res.json()) as { revoked: number };
+    console.log(revoked > 0 ? `Revoked ${revoked} token(s) with prefix ${id}.` : `No live token matched ${id}.`);
+  });
+
 // ── gen-token ─────────────────────────────────────────────────────────────────
 program
   .command('gen-token')

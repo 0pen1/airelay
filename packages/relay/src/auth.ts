@@ -47,14 +47,16 @@ interface ClientAuthResult {
 
 /**
  * Verify a JWT access_token (first connection after scanning QR code).
- * On success, the jti is written to the blacklist and a new session_token is created.
+ * On success, the jti is written to the blacklist and a new session_token is
+ * created, bound to the supplied device name (for the device management UI).
  */
 export async function verifyClientJwt(
   token: string,
   getHost: (id: string) => Host | null,
   hasJti: (jti: string) => boolean,
   addJti: (jti: string, expiresAt: number) => void,
-  createSessionToken: (hostId: string) => string,
+  createSessionToken: (hostId: string, ttlSeconds?: number, deviceName?: string) => string,
+  deviceName = '',
 ): Promise<ClientAuthResult | null> {
   try {
     // Decode without verification first to get host_id for key lookup
@@ -72,7 +74,7 @@ export async function verifyClientJwt(
     if (hasJti(payload.jti)) return null; // already used
     addJti(payload.jti, payload.exp);
 
-    const sessionToken = createSessionToken(hostId);
+    const sessionToken = createSessionToken(hostId, 7 * 24 * 3600, deviceName);
     return { hostId, sessionToken };
   } catch {
     return null;

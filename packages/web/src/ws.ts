@@ -11,6 +11,24 @@ import { E2eSession, type E2ePayload } from './e2e.js';
 
 export type MessageHandler = (msg: Record<string, unknown>) => void;
 
+/** Short human-readable device name from the user agent, e.g. "iPhone Safari". */
+function deriveDeviceName(): string {
+  const ua = navigator.userAgent;
+  const os =
+    /iPhone/.test(ua) ? 'iPhone' :
+    /iPad/.test(ua) ? 'iPad' :
+    /Android/.test(ua) ? 'Android' :
+    /Macintosh/.test(ua) ? 'Mac' :
+    /Windows/.test(ua) ? 'Windows' :
+    /Linux/.test(ua) ? 'Linux' : 'Web';
+  const browser =
+    /FxiOS|Firefox/.test(ua) ? 'Firefox' :
+    /EdgiOS|Edg\//.test(ua) ? 'Edge' :
+    /CriOS|Chrome\//.test(ua) ? 'Chrome' :
+    /Safari\//.test(ua) ? 'Safari' : 'Browser';
+  return `${os} ${browser}`;
+}
+
 export class WSManager {
   private ws: WebSocket | null = null;
   private url: string = '';
@@ -20,6 +38,9 @@ export class WSManager {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private onStatusChange: (connected: boolean, reconnecting: boolean) => void = () => {};
   private onAuthFail: () => void = () => {};
+  /** Human-readable name for this device, sent with the first auth so the
+   *  host's device list can identify it. Derived from the user agent once. */
+  private deviceName: string = deriveDeviceName();
 
   // ── E2E state ───────────────────────────────────────────────────────────
   private e2eSecret: string | null = null; // hex, from HostEntry; null = no E2E
@@ -72,7 +93,9 @@ export class WSManager {
     this.ws = ws;
 
     ws.onopen = () => {
-      ws.send(JSON.stringify({ type: 'auth', token: this.token }));
+      // device_name rides along on every auth: the relay uses it when minting
+      // a token from a JWT (first connect) and ignores it on reconnects.
+      ws.send(JSON.stringify({ type: 'auth', token: this.token, device_name: this.deviceName }));
       this.reconnectDelay = 1000;
     };
 

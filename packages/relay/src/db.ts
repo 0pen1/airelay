@@ -19,6 +19,9 @@ export interface SessionToken {
   host_id: string;
   expires_at: number;
   revoked: number;
+  device_name: string;
+  created_at: number;
+  last_used_at: number;
 }
 
 function getDbPath(): string {
@@ -47,12 +50,36 @@ export function getDb(): DatabaseSync {
     );
 
     CREATE TABLE IF NOT EXISTS session_tokens (
+      token       TEXT PRIMARY KEY,
+      host_id     TEXT NOT NULL,
+      expires_at  INTEGER NOT NULL,
+      revoked     INTEGER NOT NULL DEFAULT 0,
+      device_name TEXT NOT NULL DEFAULT '',
+      created_at  INTEGER NOT NULL DEFAULT 0,
+      last_used_at INTEGER NOT NULL DEFAULT 0
+    );
+
+    -- Rotated-out token values that still authenticate during the grace
+    -- window. Each row maps to the device row now holding a different token.
+    CREATE TABLE IF NOT EXISTS token_grace (
       token      TEXT PRIMARY KEY,
       host_id    TEXT NOT NULL,
-      expires_at INTEGER NOT NULL,
-      revoked    INTEGER NOT NULL DEFAULT 0
+      expires_at INTEGER NOT NULL
     );
   `);
+  // Migrations for pre-existing DBs (CREATE TABLE IF NOT EXISTS won't add
+  // columns to an older table).
+  const cols = getDb().prepare("PRAGMA table_info(session_tokens)").all() as Array<{ name: string }>;
+  const colNames = new Set(cols.map((c) => c.name));
+  if (!colNames.has('device_name')) {
+    getDb().exec("ALTER TABLE session_tokens ADD COLUMN device_name TEXT NOT NULL DEFAULT ''");
+  }
+  if (!colNames.has('created_at')) {
+    getDb().exec('ALTER TABLE session_tokens ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0');
+  }
+  if (!colNames.has('last_used_at')) {
+    getDb().exec('ALTER TABLE session_tokens ADD COLUMN last_used_at INTEGER NOT NULL DEFAULT 0');
+  }
   return _db;
 }
 
@@ -92,29 +119,91 @@ export function hasJti(jti: string): boolean {
 export function cleanExpiredJtis(): void {
   const now = Math.floor(Date.now() / 1000);
   getDb().prepare('DELETE FROM jti_blacklist WHERE expires_at < ?').run(now);
+  // Also drop expired grace aliases so the table stays small.
+  getDb().prepare('DELETE FROM token_grace WHERE expires_at < ?').run(now);
 }
 
 // ── Session tokens ────────────────────────────────────────────────────────────
 
-export function createSessionToken(host_id: string, ttlSeconds = 7 * 24 * 3600): string {
+/** Grace window (seconds): a rotated-out token keeps working this long so an
+ *  in-flight reconnect doesn't race its own rotation. */
+export const TOKEN_ROTATION_GRACE = 60;
+
+export function createSessionToken(
+  host_id: string,
+  ttlSeconds = 7 * 24 * 3600,
+  device_name = '',
+): string {
   const token = randomBytes(32).toString('hex');
-  const expires_at = Math.floor(Date.now() / 1000) + ttlSeconds;
+  const now = Math.floor(Date.now() / 1000);
   getDb()
-    .prepare('INSERT INTO session_tokens (token, host_id, expires_at, revoked) VALUES (?, ?, ?, 0)')
-    .run(token, host_id, expires_at);
+    .prepare(`INSERT INTO session_tokens
+      (token, host_id, expires_at, revoked, device_name, created_at, last_used_at)
+      VALUES (?, ?, ?, 0, ?, ?, ?)`)
+    .run(token, host_id, now + ttlSeconds, device_name, now, now);
   return token;
 }
 
 export function getSessionToken(token: string): SessionToken | null {
-  const row = getDb()
+  const now = Math.floor(Date.now() / 1000);
+  const db = getDb();
+
+  // Current credential on a device row.
+  let row = db
     .prepare('SELECT * FROM session_tokens WHERE token = ?')
     .get(token) as SessionToken | undefined;
-  if (!row) return null;
-  const now = Math.floor(Date.now() / 1000);
+  if (!row) {
+    // Rotated-out value still within its grace window → resolve to the
+    // device row that replaced it.
+    const grace = db
+      .prepare('SELECT host_id FROM token_grace WHERE token = ? AND expires_at >= ?')
+      .get(token, now) as { host_id: string } | undefined;
+    if (!grace) return null;
+    row = db
+      .prepare('SELECT * FROM session_tokens WHERE host_id = ? ORDER BY last_used_at DESC LIMIT 1')
+      .get(grace.host_id) as SessionToken | undefined;
+    if (!row) return null;
+  }
   if (row.revoked || row.expires_at < now) return null;
+  // Touch last_used_at at most once per minute to avoid a write per message.
+  if (now - row.last_used_at >= 60) {
+    db.prepare('UPDATE session_tokens SET last_used_at = ? WHERE token = ?').run(now, row.token);
+  }
   return row;
 }
 
 export function revokeSessionToken(token: string): void {
   getDb().prepare('UPDATE session_tokens SET revoked = 1 WHERE token = ?').run(token);
+}
+
+/** All non-expired tokens for a host (active + recently rotated-out). */
+export function listSessionTokens(host_id: string): SessionToken[] {
+  const now = Math.floor(Date.now() / 1000);
+  return getDb()
+    .prepare('SELECT * FROM session_tokens WHERE host_id = ? AND expires_at >= ? ORDER BY created_at DESC')
+    .all(host_id, now) as SessionToken[];
+}
+
+/**
+ * Token rotation: replace the token value in place for the device identified
+ * by `oldToken`. In-place means the device stays one row: the device list is
+ * stable, and revoking that row kills the device's current credential.
+ * The old value keeps working for TOKEN_ROTATION_GRACE seconds (in-flight
+ * reconnect race), enforced via a parallel grace window, not the row itself.
+ */
+export function rotateSessionToken(oldToken: string, ttlSeconds = 7 * 24 * 3600): string | null {
+  const row = getSessionToken(oldToken);
+  if (!row) return null;
+  const newToken = randomBytes(32).toString('hex');
+  const now = Math.floor(Date.now() / 1000);
+  const db = getDb();
+  // Register the old value as a grace alias pointing at the same row.
+  db.prepare(
+    `INSERT OR REPLACE INTO token_grace (token, host_id, expires_at) VALUES (?, ?, ?)`,
+  ).run(oldToken, row.host_id, now + TOKEN_ROTATION_GRACE);
+  // Swap the credential on the device row.
+  db.prepare(
+    `UPDATE session_tokens SET token = ?, expires_at = ?, last_used_at = ? WHERE token = ?`,
+  ).run(newToken, now + ttlSeconds, now, oldToken);
+  return newToken;
 }

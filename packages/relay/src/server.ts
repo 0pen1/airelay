@@ -7,6 +7,8 @@ import { randomUUID } from 'node:crypto';
 import { verifyAgentAuth, verifyClientJwt, verifySessionTokenAuth } from './auth.js';
 import {
   getHost, addJti, hasJti, createSessionToken, getSessionToken,
+  listSessionTokens, revokeSessionToken, rotateSessionToken,
+  cleanExpiredJtis,
 } from './db.js';
 
 // ESM: derive the directory of this module (was __dirname under CJS)
@@ -37,8 +39,57 @@ function sendJson(ws: WebSocket, obj: unknown): void {
 export function createRelayServer(port: number): void {
   const app = express();
 
+  // Periodic cleanup of expired JTIs and token-grace aliases (1/hour).
+  setInterval(cleanExpiredJtis, 3600_000).unref();
+
   app.get('/health', (_req, res) => {
     res.json({ ok: true, agents: agents.size, clients: clients.size });
+  });
+
+  // ── Device management API (HMAC-authenticated, host manages own devices) ────
+  // The agent CLI calls these with the same Authorization header it uses for
+  // the WS connection, so the relay never needs an extra credential. Responses
+  // never include token values — only short prefixes for identification.
+
+  app.get('/api/devices', (req, res) => {
+    const result = verifyAgentAuth(req.headers['authorization'] as string | undefined, getHost);
+    if (!result) {
+      res.status(401).json({ error: 'unauthorized' });
+      return;
+    }
+    const now = Math.floor(Date.now() / 1000);
+    const devices = listSessionTokens(result.hostId).map((t) => ({
+      id: t.token.slice(0, 8),
+      device_name: t.device_name || '(unnamed)',
+      created_at: t.created_at,
+      last_used_at: t.last_used_at,
+      expires_at: t.expires_at,
+      expired: t.expires_at < now,
+      status: t.revoked ? 'revoked' : 'active',
+    }));
+    res.json({ devices });
+  });
+
+  app.post('/api/devices/revoke', express.json(), (req, res) => {
+    const result = verifyAgentAuth(req.headers['authorization'] as string | undefined, getHost);
+    if (!result) {
+      res.status(401).json({ error: 'unauthorized' });
+      return;
+    }
+    const id = String(req.body?.['id'] ?? '');
+    if (!/^[0-9a-f]{8}$/.test(id)) {
+      res.status(400).json({ error: 'invalid id' });
+      return;
+    }
+    // id is the 8-char token prefix — revoke every live token matching it.
+    let revoked = 0;
+    for (const t of listSessionTokens(result.hostId)) {
+      if (t.token.startsWith(id)) {
+        revokeSessionToken(t.token);
+        revoked++;
+      }
+    }
+    res.json({ revoked });
   });
 
   // Serve web frontend (built by packages/web)
@@ -150,14 +201,25 @@ export function createRelayServer(port: number): void {
           }
 
           const token = msg['token'] as string;
+          // Optional device name (client sends it on first auth; used for the
+          // device management list). Bounded and sanitized below.
+          const rawDevice = typeof msg['device_name'] === 'string' ? msg['device_name'] : '';
+          const deviceName = rawDevice.replace(/[^\w\s.-]/g, '').slice(0, 40);
 
           // Try session_token first (reconnect path), then JWT (first connection)
           const stRow = verifySessionTokenAuth(token, getSessionToken);
           if (stRow) {
             hostId = stRow.hostId;
+            // Rotate on every successful reconnect: the presented token is
+            // retired after a short grace window and a fresh one is issued.
+            // A stolen token therefore works only until the next connect.
+            const fresh = rotateSessionToken(token);
+            if (fresh) {
+              sendJson(ws, { type: 'session_token_issued', session_token: fresh });
+            }
           } else {
             const jwtResult = await verifyClientJwt(
-              token, getHost, hasJti, addJti, createSessionToken,
+              token, getHost, hasJti, addJti, createSessionToken, deviceName,
             );
             if (!jwtResult) {
               // Send an explicit AUTH_FAILED before the 4001 close so the client
