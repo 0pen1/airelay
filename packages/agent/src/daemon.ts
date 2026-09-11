@@ -214,10 +214,12 @@ export function startDaemon(): void {
   const E2E_HANDSHAKE_WINDOW_MS = 10_000;
   const e2eTimerArmed = new Set<string>();
 
-  /** True when plaintext output must be dropped: the E2E grace window for
-   *  this connection has expired without a completed handshake. */
+  /** True when plaintext output must be dropped: either the handshake
+   *  window expired without E2E, or a handshake completed at some point on
+   *  this connection (latch — survives a later client_disconnected nul­ling
+   *  the session). */
   function suppressPlaintextOutput(): boolean {
-    return e2eWindowExpired;
+    return e2eWindowExpired || e2eEverReady;
   }
   let e2eWindowExpired = false;
 
@@ -241,6 +243,16 @@ export function startDaemon(): void {
     e2eTimerArmed.delete('armed');
     e2eWindowExpired = false;
   }
+
+  // ── E2E enforcement latch ──────────────────────────────────────────────────
+  // Once ANY handshake completes on this relay connection, E2E becomes
+  // MANDATORY for the rest of the connection. The current-session flag
+  // (e2e) is transient — {"type":"client_disconnected"} (a frame the relay
+  // can inject at will) nulls it, which would silently re-enable plaintext
+  // input/output if enforcement keyed on it alone. The latch survives that:
+  // after a handshake, input without a valid e2e payload is dropped and
+  // plaintext output/scrollback are suppressed, even mid-disconnect.
+  let e2eEverReady = false;
 
   function disposeSubs(sessionId: string): void {
     const list = subs.get(sessionId);
@@ -292,6 +304,10 @@ export function startDaemon(): void {
     const url = config.relayUrl.replace(/^http/, 'ws') + '/ws/agent';
     ws = new WebSocket(url, {
       headers: { Authorization: buildAuthHeader(config.hostId, config.hostSecret) },
+      // Frames come from the relay only, but cap them anyway: an oversized
+      // input frame would block the event loop in splitKeys (per-char scan)
+      // and stall every session. 1MiB ≫ any legitimate protocol message.
+      maxPayload: 1 * 1024 * 1024,
     });
 
     ws.on('open', () => {
@@ -310,6 +326,7 @@ export function startDaemon(): void {
       for (const sid of sessionSlots.keys()) freeSlot(sid);
       e2e = null; // old E2E session is dead
       resetE2eWindow(); // fresh handshake window for the new connection
+      e2eEverReady = false; // new connection: no handshake has completed yet
 
       // Heartbeat
       const ping = setInterval(() => {
@@ -356,12 +373,17 @@ export function startDaemon(): void {
     const sessionId = slotSessions.get(slot);
     if (!sessionId) return; // unknown slot — drop
     if (opcode === BinaryOpcode.INPUT) {
-      // E2E mandatory once the handshake completes: accepting plaintext input
-      // alongside encrypted input would let anyone on the path between client
-      // and agent (i.e. the relay) bypass the encryption with a raw frame.
-      // Encrypted input carries a per-connection counter (first 4 bytes of
-      // the payload, bound into the GCM AAD) so replays are rejected too.
-      if (e2e?.isReady) {
+      // E2E mandatory once the handshake completes (latched — see the JSON
+      // input path): accepting plaintext input alongside encrypted input
+      // would let anyone on the path between client and agent (i.e. the
+      // relay) bypass the encryption with a raw frame. Encrypted input
+      // carries a per-connection counter (first 4 bytes of the payload,
+      // bound into the GCM AAD) so replays are rejected too.
+      if (e2eEverReady) {
+        if (!e2e?.isReady) {
+          log('Dropped binary input after E2E latch (session nulled — plaintext not accepted)');
+          return;
+        }
         let bytes: Uint8Array;
         try {
           bytes = e2e.decryptInputBytes(payload);
@@ -400,6 +422,7 @@ export function startDaemon(): void {
         // decrypted. A fresh E2eSession per hello = new ECDH keys = forward
         // secrecy per connection.
         e2e = session;
+        e2eEverReady = true; // latch: E2E mandatory for the rest of this connection
         send(ack);
         log('E2E handshake completed');
       } else {
@@ -496,10 +519,11 @@ export function startDaemon(): void {
 
     if (type === 'input') {
       const sessionId = msg['session_id'] as string | undefined;
-      // E2E mandatory once the handshake completes: a plaintext `data` field
-      // would give anyone between client and agent (i.e. the relay) a way to
-      // inject keystrokes that bypasses the encryption entirely.
-      if (e2e?.isReady && msg['e2e'] === undefined) {
+      // E2E mandatory once the handshake completes — keyed on the LATCH
+      // (e2eEverReady), not the transient e2e session: a relay-injected
+      // {"type":"client_disconnected"} nulls the session but must NOT
+      // re-open the plaintext path.
+      if (e2eEverReady && msg['e2e'] === undefined) {
         log('Dropped plaintext input while E2E active (downgrade attempt?)');
         return;
       }
@@ -604,23 +628,30 @@ export function startDaemon(): void {
     // flow. If none arrives before the window closes, plaintext output stops.
     armE2eWindow();
 
-    // Send scrollback in 64 KB chunks (encrypted if E2E is active)
+    // Send scrollback in 64 KB chunks. Scrollback carries the terminal's
+    // recent history (pasted secrets included) — the SAME confidentiality
+    // rule as live output applies: once the handshake window has expired
+    // without E2E (or a handshake completed and the latch is set), it must
+    // not go out in plaintext. It is NOT gated on the current attach state
+    // of the requesting client beyond this, because the relay can attach on
+    // its own at any time.
     try {
       const scrollback = await session.driver.getScrollback(sessionId);
+      const allowPlaintext = !suppressPlaintextOutput();
       const chunks: string[] = [];      for (let i = 0; i < scrollback.length; i += CHUNK_SIZE) {
         chunks.push(scrollback.slice(i, i + CHUNK_SIZE));
       }
       if (chunks.length === 0) {
         if (e2e?.isReady) {
           send({ type: 'scrollback', session_id: sessionId, e2e: e2e.encrypt(''), seq: 0, done: true });
-        } else {
+        } else if (allowPlaintext) {
           send({ type: 'scrollback', session_id: sessionId, data: '', seq: 0, done: true });
         }
       } else {
         chunks.forEach((chunk, idx) => {
           if (e2e?.isReady) {
             send({ type: 'scrollback', session_id: sessionId, e2e: e2e.encrypt(chunk), seq: idx, done: idx === chunks.length - 1 });
-          } else {
+          } else if (allowPlaintext) {
             send({ type: 'scrollback', session_id: sessionId, data: chunk, seq: idx, done: idx === chunks.length - 1 });
           }
         });

@@ -160,9 +160,19 @@ export function createRelayServer(port: number): { shutdown: () => Promise<void>
     res.json({ ok: true });
   });
 
+  // Minimum spacing between "agent waiting" push bursts per host. The
+  // trigger is an agent-supplied frame (session_status waiting=true) — a
+  // compromised host could otherwise drive unbounded outbound push traffic
+  // (relay cost, push-service rate bans on the VAPID key, user spam).
+  const PUSH_MIN_INTERVAL_MS = 30_000;
+  const lastPushAt = new Map<string, number>();
+
   /** Fire "agent waiting" pushes to all of a host's subscriptions. Failures
    *  with 404/410 mean the subscription is dead — drop it. */
   async function pushWaiting(hostId: string): Promise<void> {
+    const now = Date.now();
+    if (now - (lastPushAt.get(hostId) ?? 0) < PUSH_MIN_INTERVAL_MS) return;
+    lastPushAt.set(hostId, now);
     const subs = getPushSubscriptions(hostId);
     for (const sub of subs) {
       try {
@@ -304,7 +314,11 @@ export function createRelayServer(port: number): { shutdown: () => Promise<void>
   });
 
   const server = createServer(app);
-  const wss = new WebSocketServer({ server });
+  // maxPayload: protocol frames are small (JSON control, ≤64KB scrollback
+  // chunks, terminal I/O). ws's 100MiB default lets a single authenticated
+  // (or even pre-auth) frame allocate 100MB — cheap memory DoS on a public
+  // endpoint. 1MiB is generous for every message the protocol defines.
+  const wss = new WebSocketServer({ server, maxPayload: 1 * 1024 * 1024 });
 
   wss.on('connection', async (ws, req) => {
     // express's `trust proxy` only decorates middleware-chain requests; the
