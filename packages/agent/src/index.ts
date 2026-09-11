@@ -51,7 +51,10 @@ program
     const hostSecret = randomBytes(32).toString('hex');
 
     mkdirSync(CONFIG_DIR, { recursive: true });
-    writeFileSync(CONFIG_FILE, JSON.stringify({ relayUrl, hostId, hostSecret }, null, 2));
+    // 0600: config.json holds host_secret — the root key for relay auth AND
+    // the e2e_secret derivation. World-readable would hand any local user
+    // full control of this host.
+    writeFileSync(CONFIG_FILE, JSON.stringify({ relayUrl, hostId, hostSecret }, null, 2), { mode: 0o600 });
 
     // Default agents.json
     if (!existsSync(AGENTS_FILE)) {

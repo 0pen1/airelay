@@ -57,6 +57,9 @@ export class WSManager {
   private latencySentAt = 0;
   private lastRttMs = 0;
 
+  // ── E2E downgrade watchdog ──────────────────────────────────────────────
+  private e2eWatchdog: ReturnType<typeof setTimeout> | null = null;
+
   /** Last measured round-trip time to the agent (via latency probes), or 0. */
   get latencyMs(): number { return this.lastRttMs; }
 
@@ -134,6 +137,16 @@ export class WSManager {
         this.onStatusChange(true, false);
         if (this.e2eSecret) {
           this.initiateE2eHandshake();
+          // Downgrade watchdog: if the handshake doesn't complete within the
+          // window, something between us and the agent (i.e. the relay) is
+          // suppressing it. Warn loudly instead of silently typing in the
+          // clear.
+          if (this.e2eWatchdog) clearTimeout(this.e2eWatchdog);
+          this.e2eWatchdog = setTimeout(() => {
+            if (this.ws && !this.e2eSession?.isReady) {
+              showToast('⚠️ 加密握手未完成 — 当前会话可能被降级为明文，请断开并检查中继');
+            }
+          }, 12_000);
         }
         // Register/refresh the Web Push subscription once per session (needs
         // the session token that auth just validated). Fire-and-forget.
@@ -198,6 +211,7 @@ export class WSManager {
     ws.onclose = (ev: CloseEvent) => {
       this.ws = null;
       this.e2eSession = null; // E2E state dies with the connection
+      if (this.e2eWatchdog) { clearTimeout(this.e2eWatchdog); this.e2eWatchdog = null; }
       this.slots.clear();     // slot assignments die with the connection
       if (this.latencyTimer) { clearInterval(this.latencyTimer); this.latencyTimer = null; }
       if (ev.code === 4001) {
@@ -243,8 +257,9 @@ export class WSManager {
         return;
       }
       if (this.e2eSession?.isReady) {
-        // JSON fallback with E2E (legacy path)
-        this.e2eSession.encrypt(obj['data'] as string).then((e2e) => {
+        // JSON path with E2E: sequence number bound via GCM AAD so the relay
+        // cannot replay a captured input later.
+        this.e2eSession.encryptInput(obj['data'] as string).then((e2e) => {
           const encrypted = { type: obj['type'], session_id: obj['session_id'], e2e };
           if (this.ws?.readyState === WebSocket.OPEN) {
             this.ws.send(JSON.stringify(encrypted));
@@ -273,7 +288,7 @@ export class WSManager {
       this.ws.send(encodeBinaryFrame(BinaryOpcode.INPUT, slot, payload));
     };
     if (this.e2eSession?.isReady) {
-      this.e2eSession.encryptBytes(plaintext).then(sendFrame).catch(() => {
+      this.e2eSession.encryptInputBytes(plaintext).then(sendFrame).catch(() => {
         console.warn('E2E encryption failed, dropping input');
       });
     } else {

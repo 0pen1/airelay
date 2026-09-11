@@ -138,10 +138,16 @@ export function startDaemon(): void {
   /** Send a binary output frame for a session (E2E-encrypts payload if active). */
   function sendBinaryOutput(sessionId: string, data: string): void {
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    // Downgrade guard (mirrors the JSON output path): before the E2E
+    // handshake completes AND after the grace window lapses, plaintext
+    // binary output must not flow — a hostile relay suppressing the
+    // handshake would otherwise still read the terminal.
+    const encrypted = !!e2e && e2e.isReady;
+    if (!encrypted && suppressPlaintextOutput()) return;
     const slot = sessionSlots.get(sessionId);
     if (slot === undefined) return; // no slot — caller falls back to JSON
     const plaintext = Buffer.from(data, 'utf8');
-    const payload = e2e?.isReady ? e2e.encryptBytes(plaintext) : plaintext;
+    const payload = encrypted && e2e ? e2e.encryptBytes(plaintext) : plaintext;
     ws.send(encodeBinaryFrame(BinaryOpcode.OUTPUT, slot, payload), { binary: true });
   }
 
@@ -194,6 +200,46 @@ export function startDaemon(): void {
   /** Push status for all sessions (used on list/attach so the phone gets fresh state). */
   function pushAllStatus(): void {
     for (const sessionId of activity.keys()) broadcastStatus(sessionId, true);
+  }
+
+  // ── E2E enforcement window ─────────────────────────────────────────────────
+  // After a client completes relay auth we expect an e2e_hello within a short
+  // window. Once that window passes without E2E becoming ready, plaintext
+  // output is suppressed: a relay that simply withholds the handshake (the
+  // cheapest downgrade attack) must not be able to read terminal output in
+  // the clear. Legacy clients without an e2e_secret never start the timer —
+  // E2E readiness on the agent side is driven by hello arrival, so the timer
+  // is armed on the first output subscription instead (a proxy for "client
+  // attached and should be handshaking").
+  const E2E_HANDSHAKE_WINDOW_MS = 10_000;
+  const e2eTimerArmed = new Set<string>();
+
+  /** True when plaintext output must be dropped: the E2E grace window for
+   *  this connection has expired without a completed handshake. */
+  function suppressPlaintextOutput(): boolean {
+    return e2eWindowExpired;
+  }
+  let e2eWindowExpired = false;
+
+  function armE2eWindow(): void {
+    // Arm once per relay connection; E2E readiness cancels it. Legacy
+    // flows (no e2e_secret anywhere) also complete a hello — they just use
+    // a different secret — so an expired window means a hostile middlebox,
+    // not a legacy client. Reset on reconnect (see ws 'open' handler).
+    if (e2eTimerArmed.has('armed')) return;
+    e2eTimerArmed.add('armed');
+    const t = setTimeout(() => {
+      if (!e2e?.isReady) {
+        e2eWindowExpired = true;
+        log('E2E handshake not completed within window — suppressing plaintext output');
+      }
+    }, E2E_HANDSHAKE_WINDOW_MS);
+    t.unref();
+  }
+
+  function resetE2eWindow(): void {
+    e2eTimerArmed.delete('armed');
+    e2eWindowExpired = false;
   }
 
   function disposeSubs(sessionId: string): void {
@@ -263,6 +309,7 @@ export function startDaemon(): void {
       // Slots are per-connection: the new client will get fresh ones on attach.
       for (const sid of sessionSlots.keys()) freeSlot(sid);
       e2e = null; // old E2E session is dead
+      resetE2eWindow(); // fresh handshake window for the new connection
 
       // Heartbeat
       const ping = setInterval(() => {
@@ -309,16 +356,27 @@ export function startDaemon(): void {
     const sessionId = slotSessions.get(slot);
     if (!sessionId) return; // unknown slot — drop
     if (opcode === BinaryOpcode.INPUT) {
-      // Decrypt if E2E is active, then feed the terminal as UTF-8 text.
-      let bytes: Uint8Array;
-      try {
-        bytes = e2e?.isReady ? e2e.decryptBytes(payload) : payload;
-      } catch {
-        return; // tampered or wrong key — drop
+      // E2E mandatory once the handshake completes: accepting plaintext input
+      // alongside encrypted input would let anyone on the path between client
+      // and agent (i.e. the relay) bypass the encryption with a raw frame.
+      // Encrypted input carries a per-connection counter (first 4 bytes of
+      // the payload, bound into the GCM AAD) so replays are rejected too.
+      if (e2e?.isReady) {
+        let bytes: Uint8Array;
+        try {
+          bytes = e2e.decryptInputBytes(payload);
+        } catch {
+          log('Dropped encrypted binary input (replay or tamper)');
+          return;
+        }
+        const session = sessionManager.get(sessionId);
+        if (!session) return;
+        session.driver.sendInput(sessionId, Buffer.from(bytes).toString('utf8')).catch(() => {});
+        return;
       }
       const session = sessionManager.get(sessionId);
       if (!session) return;
-      session.driver.sendInput(sessionId, Buffer.from(bytes).toString('utf8')).catch(() => {});
+      session.driver.sendInput(sessionId, Buffer.from(payload).toString('utf8')).catch(() => {});
     }
     // Unknown opcodes are ignored (forward compatibility).
   }
@@ -348,9 +406,7 @@ export function startDaemon(): void {
         log('E2E handshake failed — sig verification error');
       }
       return;
-    }
-
-    if (type === 'client_disconnected') {
+    }    if (type === 'client_disconnected') {
       const sid = msg['session_id'] as string | undefined;
       if (sid) {
         sessionManager.unlock(sid);
@@ -440,15 +496,22 @@ export function startDaemon(): void {
 
     if (type === 'input') {
       const sessionId = msg['session_id'] as string | undefined;
-      // If the message has an `e2e` field, decrypt it to recover the plaintext
-      // data. Fall back to the plain `data` field for backward compatibility
-      // (clients without E2E / legacy QR tokens).
+      // E2E mandatory once the handshake completes: a plaintext `data` field
+      // would give anyone between client and agent (i.e. the relay) a way to
+      // inject keystrokes that bypasses the encryption entirely.
+      if (e2e?.isReady && msg['e2e'] === undefined) {
+        log('Dropped plaintext input while E2E active (downgrade attempt?)');
+        return;
+      }
       let data: string | undefined;
-      if (msg['e2e'] && e2e?.isReady) {
+      if (msg['e2e']) {
+        if (!e2e?.isReady) return; // encrypted frame but no E2E session — drop
         try {
-          data = e2e.decrypt(msg['e2e'] as E2ePayload);
+          // decryptInput enforces the per-connection replay counter.
+          data = e2e.decryptInput(msg['e2e'] as E2ePayload);
         } catch {
-          return; // decryption failed — drop (tampered or wrong key)
+          log('Dropped encrypted input (replay or tamper)');
+          return;
         }
       } else {
         data = msg['data'] as string | undefined;
@@ -515,12 +578,14 @@ export function startDaemon(): void {
       session.driver.onOutput(sessionId, (data) => {
         // Hot path: binary frame. Falls back to JSON only if the slot was
         // lost (defensive; allocateSlot in this function guarantees one).
+        // Once E2E is ready, plaintext fallback is forbidden — drop instead
+        // of leaking terminal output to the relay in the clear.
         if (sessionSlots.has(sessionId)) {
           sendBinaryOutput(sessionId, data);
         } else if (e2e?.isReady) {
           const payload = e2e.encrypt(data);
           send({ type: 'output', session_id: sessionId, e2e: payload });
-        } else {
+        } else if (!suppressPlaintextOutput()) {
           send({ type: 'output', session_id: sessionId, data });
         }
       }),
@@ -535,6 +600,9 @@ export function startDaemon(): void {
       }),
     );
     subs.set(sessionId, list);
+    // Expect an E2E handshake now that a client is attached and output will
+    // flow. If none arrives before the window closes, plaintext output stops.
+    armE2eWindow();
 
     // Send scrollback in 64 KB chunks (encrypted if E2E is active)
     try {

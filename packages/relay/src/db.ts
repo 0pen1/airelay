@@ -3,7 +3,7 @@
 
 import { DatabaseSync } from 'node:sqlite';
 import { homedir } from 'node:os';
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, chmodSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomBytes } from 'node:crypto';
 
@@ -25,7 +25,8 @@ export interface SessionToken {
   last_used_at: number;
 }
 
-function getDbPath(): string {
+/** Config dir used by this relay instance (exported for CLI siblings). */
+export function getDbPath(): string {
   const isRoot = process.getuid?.() === 0;
   const dir = process.env.AIRELAY_CONFIG_DIR
     ?? (isRoot ? '/etc/airelay' : join(homedir(), '.config', 'airelay'));
@@ -38,6 +39,12 @@ let _db: DatabaseSync | null = null;
 export function getDb(): DatabaseSync {
   if (_db) return _db;
   _db = new DatabaseSync(getDbPath());
+  // relay.db holds host secrets and device tokens — enforce 0600 (SQLite
+  // keeps the file's existing mode; an explicit chmod also fixes pre-existing
+  // world-readable DBs created by older versions).
+  try {
+    chmodSync(getDbPath(), 0o600);
+  } catch { /* best effort — e.g. fs mounted without permission support */ }
   _db.exec(`
     CREATE TABLE IF NOT EXISTS hosts (
       host_id    TEXT PRIMARY KEY,
@@ -135,6 +142,14 @@ export function getHost(host_id: string): Host | null {
 
 export function revokeHost(host_id: string): void {
   getDb().prepare('DELETE FROM hosts WHERE host_id = ?').run(host_id);
+  // A revoked host's downstream credentials must die with it: otherwise
+  // tokens already issued to phones keep authenticating (the session-token
+  // path never rechecks the hosts table), and the live agent WS would keep
+  // forwarding. The server layer also kicks any connected sockets.
+  getDb().prepare('DELETE FROM session_tokens WHERE host_id = ?').run(host_id);
+  getDb().prepare(`DELETE FROM token_grace WHERE device_id NOT IN
+    (SELECT DISTINCT device_id FROM session_tokens)`).run();
+  getDb().prepare('DELETE FROM push_subscriptions WHERE host_id = ?').run(host_id);
 }
 
 export function listHosts(): Host[] {
@@ -281,4 +296,9 @@ export function getPushSubscriptions(host_id: string): PushSubRow[] {
 
 export function deletePushSubscription(endpoint: string): void {
   getDb().prepare('DELETE FROM push_subscriptions WHERE endpoint = ?').run(endpoint);
+}
+
+/** Host-scoped delete: only removes the endpoint if it belongs to host_id. */
+export function deletePushSubscriptionScoped(endpoint: string, host_id: string): void {
+  getDb().prepare('DELETE FROM push_subscriptions WHERE endpoint = ? AND host_id = ?').run(endpoint, host_id);
 }

@@ -5,14 +5,24 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { verifyAgentAuth, verifyClientJwt, verifySessionTokenAuth } from './auth.js';
+import { timingSafeEqual } from 'node:crypto';
 import {
   getHost, addJti, hasJti, createSessionToken, getSessionToken,
   listSessionTokens, revokeSessionToken, rotateSessionToken,
   cleanExpiredJtis, upsertPushSubscription, getPushSubscriptions,
-  deletePushSubscription,
+  deletePushSubscription, deletePushSubscriptionScoped,
 } from './db.js';
 import { initPush, getVapidPublicKey, sendPush } from './push.js';
 import { allow, startSweep } from './rate-limit.js';
+
+/** Constant-time string comparison for bearer tokens (avoids leaking the
+ *  expected value one byte at a time via response timing). */
+function tokenEquals(a: string | undefined, b: string): boolean {
+  const ab = Buffer.from(a ?? '', 'utf8');
+  const bb = Buffer.from(b, 'utf8');
+  if (ab.length !== bb.length) return false; // length alone leaks little; compare content in time
+  return timingSafeEqual(ab, bb);
+}
 
 // ESM: derive the directory of this module (was __dirname under CJS)
 const __dirname = join(fileURLToPath(import.meta.url), '..');
@@ -54,6 +64,20 @@ function sendJson(ws: WebSocket, obj: unknown): void {
   }
 }
 
+// A client that stops reading its socket (slow phone, hostile peer) makes
+// ws.send() buffer without bound in the relay's memory — one such peer can
+// OOM the whole process, taking down every host. Deliver only while the
+// peer keeps up; over the cap, drop the frame (terminal I/O is lossy by
+// design — the client resyncs on the next repaint/scrollback).
+const MAX_BUFFERED_BYTES = 4 * 1024 * 1024;
+
+function forwardOrDrop(ws: WebSocket, data: Buffer | string, binary: boolean): boolean {
+  if (ws.readyState !== WebSocket.OPEN) return false;
+  if (ws.bufferedAmount > MAX_BUFFERED_BYTES) return false;
+  ws.send(data, { binary });
+  return true;
+}
+
 /** Metadata-only audit line: direction, message type (if parseable), size.
  *  Never logs payload contents — preserves the zero-knowledge guarantee while
  *  giving operators a trace of what flowed through the relay. */
@@ -61,8 +85,11 @@ function audit(dir: 'agent->client' | 'client->agent', data: Buffer, isBinary: b
   let type = isBinary ? 'binary' : '?';
   if (!isBinary) {
     try {
-      const parsed = JSON.parse(data.toString()) as { type?: string };
-      type = parsed.type ?? '?';
+      // Sniff only the type field — parse just the head of the frame instead
+      // of the whole (potentially large) JSON payload; hot-path cost saver.
+      const head = data.subarray(0, 512).toString();
+      const m = /"type"\s*:\s*"([^"]+)"/.exec(head);
+      type = m?.[1] ?? '?';
     } catch { /* keep '?' */ }
   }
   console.log(`[AUDIT ${new Date().toISOString()}] ${dir} host=${hostId} type=${type} bytes=${data.length}`);
@@ -70,6 +97,19 @@ function audit(dir: 'agent->client' | 'client->agent', data: Buffer, isBinary: b
 
 export function createRelayServer(port: number): { shutdown: () => Promise<void> } {
   const app = express();
+
+  // Behind the TLS reverse proxy (the documented deployment), every request
+  // arrives from 127.0.0.1 — keying rate limits on socket address would give
+  // ALL clients one shared bucket (a single attacker could lock everyone out)
+  // and make the loopback-only /metrics check meaningless. Trust exactly one
+  // proxy hop and use the X-Forwarded-For client address instead.
+  app.set('trust proxy', 1);
+
+  /** Real client IP: req.ip honours `trust proxy`; fall back to the socket
+   *  address when the proxy didn't send X-Forwarded-For (direct dev access). */
+  function clientIp(req: { ip?: string; socket: { remoteAddress?: string } }): string {
+    return req.ip || req.socket.remoteAddress || 'unknown';
+  }
 
   // Periodic cleanup of expired JTIs and token-grace aliases (1/hour).
   setInterval(cleanExpiredJtis, 3600_000).unref();
@@ -108,12 +148,15 @@ export function createRelayServer(port: number): { shutdown: () => Promise<void>
 
   app.post('/api/push/unsubscribe', express.json(), (req, res) => {
     const token = String(req.headers['authorization']?.replace(/^Bearer\s+/i, '') ?? '');
-    if (!getSessionToken(token)) {
+    const row = getSessionToken(token);
+    if (!row) {
       res.status(401).json({ error: 'unauthorized' });
       return;
     }
     const endpoint = String(req.body?.['endpoint'] ?? '');
-    if (endpoint) deletePushSubscription(endpoint);
+    // Only delete subscriptions owned by THIS token's host — otherwise one
+    // host's stolen token could unsubscribe another host's devices.
+    if (endpoint) deletePushSubscriptionScoped(endpoint, row.host_id);
     res.json({ ok: true });
   });
 
@@ -145,22 +188,14 @@ export function createRelayServer(port: number): { shutdown: () => Promise<void>
 
   // Process-lifetime counters + current connection gauge. Host-id metadata
   // only — no message contents, keeping the zero-knowledge posture.
-  // Set AIRELAY_METRICS_TOKEN to require `Authorization: Bearer <token>`;
-  // without it, only loopback clients may read metrics (a public deployment
-  // must set the token).
+  // Requires `Authorization: Bearer <AIRELAY_METRICS_TOKEN>` — the old
+  // loopback fallback is worthless behind the reverse proxy (every request
+  // arrives from 127.0.0.1), so without a token the endpoint is closed.
   app.get('/metrics', (req, res) => {
     const required = process.env.AIRELAY_METRICS_TOKEN;
-    if (required) {
-      if (req.headers['authorization'] !== `Bearer ${required}`) {
-        res.status(401).json({ error: 'unauthorized' });
-        return;
-      }
-    } else {
-      const ip = req.socket.remoteAddress ?? '';
-      if (ip !== '127.0.0.1' && ip !== '::1' && ip !== '::ffff:127.0.0.1') {
-        res.status(401).json({ error: 'metrics requires AIRELAY_METRICS_TOKEN' });
-        return;
-      }
+    if (!required || !tokenEquals(req.headers['authorization'], `Bearer ${required}`)) {
+      res.status(401).json({ error: 'metrics requires AIRELAY_METRICS_TOKEN' });
+      return;
     }
     res.json({
       uptime_seconds: Math.floor(Date.now() / 1000) - metrics.startedAt,
@@ -231,6 +266,36 @@ export function createRelayServer(port: number): { shutdown: () => Promise<void>
     res.json({ revoked });
   });
 
+  // ── Admin: host revocation kick ────────────────────────────────────────────
+  // `airelay-relay revoke-host` deletes credentials from the DB directly, but
+  // this running process still holds live sockets. The CLI pings this
+  // endpoint after revoking so connected agents/clients are dropped now, not
+  // at their next reconnect. Auth: AIRELAY_ADMIN_TOKEN (loopback CLI shares
+  // the env with systemd); when unset the endpoint is closed.
+  app.post('/api/admin/kick-host', express.json(), (req, res) => {
+    const required = process.env.AIRELAY_ADMIN_TOKEN;
+    if (!required || !tokenEquals(req.headers['authorization'], `Bearer ${required}`)) {
+      res.status(401).json({ error: 'unauthorized' });
+      return;
+    }
+    const hostId = String(req.body?.['host_id'] ?? '');
+    if (!hostId) {
+      res.status(400).json({ error: 'host_id required' });
+      return;
+    }
+    const agent = agents.get(hostId);
+    if (agent) {
+      try { agent.ws.close(4003, 'Host revoked'); } catch { /* already closed */ }
+    }
+    let kicked = 0;
+    for (const client of clients.values()) {
+      if (client.hostId !== hostId) continue;
+      try { client.ws.close(4003, 'Host revoked'); } catch { /* already closed */ }
+      kicked++;
+    }
+    res.json({ ok: true, agent_was_connected: !!agent, clients_kicked: kicked });
+  });
+
   // Serve web frontend (built by packages/web)
   const publicDir = join(__dirname, 'public');
   app.use(express.static(publicDir));
@@ -242,6 +307,12 @@ export function createRelayServer(port: number): { shutdown: () => Promise<void>
   const wss = new WebSocketServer({ server });
 
   wss.on('connection', async (ws, req) => {
+    // express's `trust proxy` only decorates middleware-chain requests; the
+    // WS upgrade request is a bare IncomingMessage, so resolve the client IP
+    // here manually (first X-Forwarded-For hop, else socket address).
+    const fwd = (req.headers['x-forwarded-for'] as string | undefined)?.split(',')[0]?.trim();
+    const socketAddr = req.socket.remoteAddress ?? 'unknown';
+    const wsClientIp = fwd || socketAddr;
     const url = new URL(req.url ?? '', `http://localhost`);
     const path = url.pathname;
     const authHeader = req.headers['authorization'] as string | undefined;
@@ -274,9 +345,7 @@ export function createRelayServer(port: number): { shutdown: () => Promise<void>
           if (isBinary) {
             // Binary frames (terminal I/O) pass through untouched —
             // decoding/encoding here would corrupt them.
-            if (client.ws.readyState === WebSocket.OPEN) {
-              client.ws.send(data, { binary: true });
-            }
+            forwardOrDrop(client.ws, data as Buffer, true);
           } else {
             // Text frames are JSON. Track session_id for cleanup on
             // disconnect, then forward the string as-is (no parse→
@@ -294,9 +363,7 @@ export function createRelayServer(port: number): { shutdown: () => Promise<void>
                 void pushWaiting(hostId);
               }
             } catch { /* not JSON — forward anyway */ }
-            if (client.ws.readyState === WebSocket.OPEN) {
-              client.ws.send(msg);
-            }
+            forwardOrDrop(client.ws, msg, false);
           }
         }
       });
@@ -322,7 +389,10 @@ export function createRelayServer(port: number): { shutdown: () => Promise<void>
       let authed = false;
       let hostId = '';
       let connId = '';
-      const clientIp = req.socket.remoteAddress ?? 'unknown';
+      // Behind the reverse proxy the socket address is 127.0.0.1 for everyone;
+      // use the proxy-forwarded address so each device gets its own
+      // rate-limit bucket instead of one shared bucket.
+      const clientIp = wsClientIp;
 
       const authTimeout = setTimeout(() => {
         if (!authed) ws.close(4001, 'Auth timeout');
@@ -331,6 +401,7 @@ export function createRelayServer(port: number): { shutdown: () => Promise<void>
       // Per-IP cap on auth attempts (successes count too — one device barely
       // dents it, a token-guessing loop exhausts it).
       if (!allow(`auth:${clientIp}`, 30, 60_000)) {
+        clearTimeout(authTimeout);
         ws.close(4008, 'Too many auth attempts');
         return;
       }

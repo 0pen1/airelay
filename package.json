@@ -8,5 +8,10 @@
     "copy:web": "rm -rf packages/relay/dist/public && cp -r packages/web/dist packages/relay/dist/public",
     "dev:relay": "pnpm --filter @airelay/relay dev",
     "dev:agent": "pnpm --filter @airelay/agent dev"
+  },
+  "pnpm": {
+    "overrides": {
+      "qs": "6.16.0"
+    }
   }
 }

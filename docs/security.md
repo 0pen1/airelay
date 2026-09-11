@@ -73,7 +73,20 @@ Relay records a JWT, replays it later to impersonate client.
 
 Attacker records agent's `Authorization` header, replays it.
 
-**Mitigation:** Timestamp in HMAC message. Relay rejects signatures older than ±60 seconds.
+**Mitigation:** Timestamp in HMAC message. Relay rejects signatures older than ±30 seconds.
+
+**Attack c: Replay encrypted terminal input**
+
+Relay captures a legitimate encrypted input (e.g. a `y\n` sent to confirm a
+permission prompt) and replays it verbatim later, hoping to re-confirm the
+same prompt while the user is away.
+
+**Mitigation:** Every E2E-encrypted input carries a per-connection sequence
+number bound into the GCM AAD. The agent tracks the counter and rejects any
+input whose seq is not strictly greater than the last accepted one — and
+mutating the seq to pass that check breaks the GCM tag. (JSON path: `seq`
+field on the `e2e` payload. Binary path: first 4 bytes of the payload,
+big-endian.)
 
 ### 5. Tamper with encrypted messages
 
@@ -86,6 +99,30 @@ Attacker records agent's `Authorization` header, replays it.
 **Attack:** Attacker compromises one E2E session key, uses it to decrypt future sessions.
 
 **Mitigation:** Forward secrecy. New ECDH keypair generated for every connection. Old session keys cannot decrypt new sessions.
+
+### 7. Relay suppresses the E2E handshake (downgrade)
+
+**Attack:** Instead of breaking the crypto, the relay simply drops
+`e2e_hello`/`e2e_ack` frames so the session stays in plaintext mode.
+
+**Mitigation (defense in depth):**
+- Agent: once a client attaches, an E2E handshake is expected within a
+  10 s window; after that, plaintext output is suppressed and plaintext
+  input is always rejected once E2E is active (a relay cannot mix raw and
+  encrypted keystrokes).
+- Client: a watchdog warns the user if the handshake has not completed
+  shortly after auth.
+
+### 8. Relay injects content into the web client
+
+**Attack:** The relay forges forwarded protocol frames (e.g. a
+`sessions_list` with a hostile `agent_name`) to inject HTML/JS into the
+phone's web app, which holds every host's session tokens and e2e secrets in
+localStorage.
+
+**Mitigation:** All relay-forwarded metadata rendered by the web client is
+HTML-escaped before insertion, and the app ships a Content-Security-Policy
+(`script-src 'self'`) so injected markup cannot execute.
 
 ## Cryptographic Primitives
 
@@ -212,7 +249,7 @@ Used for: Encrypting terminal I/O
 
 ```
 1. Agent generates JWT:
-   {hostId, jti:<random-uuid>, iat:<now>, exp:<now+5min>}
+   {hostId, jti:<random-uuid>, iat:<now>, exp:<now+TTL>}
    Signed with host_secret (HMAC-SHA256)
 
 2. Client sends: {type:'auth', token:<jwt>}
@@ -234,7 +271,7 @@ Used for: Encrypting terminal I/O
 ```
 
 **Security properties:**
-- JWT valid for 5 minutes
+- JWT valid for a short TTL (default 24h via `airelay gen-token`, configurable with `--ttl`; keep it short — the JWT is single-use)
 - Single-use (JTI prevents replay)
 - Session token valid for 7 days
 - Session token is opaque (unpredictable, cannot be forged)

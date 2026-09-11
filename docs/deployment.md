@@ -211,15 +211,26 @@ journalctl -u airelay-relay -f          # live logs (incl. [AUDIT] lines)
 
 ## 5. Production hardening checklist
 
-- [ ] **Metrics token**: set `AIRELAY_METRICS_TOKEN=<random-hex>` in the
+- [ ] **Metrics token (required)**: set `AIRELAY_METRICS_TOKEN=<random-hex>` in the
       relay's environment (systemd `Environment=` line or an
-      `EnvironmentFile=`). Without it, `/metrics` is loopback-only — which
-      the nginx/Caddy proxy bypasses, so on a public deployment **always
-      set the token**:
+      `EnvironmentFile=`). `/metrics` returns 401 until the token is set —
+      behind the reverse proxy every request arrives from 127.0.0.1, so the
+      old loopback fallback would have exposed metrics publicly:
 
       ```bash
       curl -s -H "Authorization: Bearer $TOKEN" https://relay.example.com/metrics
       ```
+
+- [ ] **Admin token (recommended)**: set `AIRELAY_ADMIN_TOKEN=<random-hex>`
+      (same value in the relay's environment and the shell that runs
+      `airelay-relay revoke-host`) so host revocation immediately kicks the
+      host's live WebSocket connections instead of waiting for them to
+      reconnect into the now-empty auth check.
+- [ ] **Rate limiting & real client IP**: rate limits key on the client IP
+      from `X-Forwarded-For` (first hop). Both Caddy and the nginx config
+      above set it; if you swap in a different proxy, keep that header
+      intact — otherwise all clients share one bucket and any single client
+      can exhaust the auth quota for everyone.
 
 - [ ] **Rate limiting** is built in (auth per-IP 30/min with failure
       penalty; 200 msg/s per connection) — no proxy configuration needed.

@@ -7,7 +7,11 @@
 // using node:crypto; the two MUST produce identical outputs for interop.
 //
 // Wire format for encrypted payloads:
-//   { v: 1, iv: <base64 12-byte nonce>, ct: <base64 ciphertext+16-byte tag> }
+//   { v: 1, seq: <n>, iv: <base64 12-byte nonce>, ct: <base64 ciphertext+16-byte tag> }
+// `seq` is a per-connection monotonically increasing input-counter (omitted /
+// undefined on output frames). It is bound into the GCM AAD so a captured
+// payload cannot be replayed later: the receiver rejects any input whose
+// sequence number is not strictly greater than the last one it accepted.
 //
 // Handshake (after WS auth completes):
 //   phone → agent: { type:'e2e_hello', pub: <base64 raw P-256 pubkey>, sig: HMAC(e2eSecret, pub) }
@@ -16,6 +20,8 @@
 
 export interface E2ePayload {
   v: 1;
+  /** Input sequence number — bound into GCM AAD for replay protection. */
+  seq?: number;
   iv: string;   // base64, 12 bytes
   ct: string;   // base64, ciphertext || 16-byte GCM auth tag
 }
@@ -110,39 +116,39 @@ export async function deriveSessionKey(
 
 // ── AES-256-GCM encrypt / decrypt ────────────────────────────────────────────
 
-export async function encrypt(key: CryptoKey, plaintext: string): Promise<E2ePayload> {
+export async function encrypt(key: CryptoKey, plaintext: string, aad?: Uint8Array): Promise<E2ePayload> {
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const encoded = new TextEncoder().encode(plaintext);
-  const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, encoded);
+  const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv, additionalData: aad }, key, encoded);
   return { v: 1, iv: b64Encode(iv), ct: b64Encode(ct) };
 }
 
-export async function decrypt(key: CryptoKey, payload: E2ePayload): Promise<string> {
+export async function decrypt(key: CryptoKey, payload: E2ePayload, aad?: Uint8Array): Promise<string> {
   const iv = b64Decode(payload.iv);
   const ct = b64Decode(payload.ct);
-  const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, ct);
+  const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv, additionalData: aad }, key, ct);
   return new TextDecoder().decode(pt);
 }
 
 // ── Raw-byte AES-256-GCM (binary frame payloads) ─────────────────────────────
 //
-// Same wire layout as E2ePayload but without base64: payload = iv(12) || ct||tag.
-// Used for terminal I/O binary frames where base64+JSON overhead is avoided.
+// Input frames carry a 4-byte big-endian sequence header: payload = seq(4) || iv(12) || ct||tag.
+// Output frames omit the header: payload = iv(12) || ct||tag.
 
-export async function encryptBytes(key: CryptoKey, plaintext: Uint8Array): Promise<Uint8Array> {
+export async function encryptBytes(key: CryptoKey, plaintext: Uint8Array, aad?: Uint8Array): Promise<Uint8Array> {
   const iv = crypto.getRandomValues(new Uint8Array(12));
-  const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, plaintext);
+  const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv, additionalData: aad }, key, plaintext);
   const out = new Uint8Array(12 + ct.byteLength);
   out.set(iv, 0);
   out.set(new Uint8Array(ct), 12);
   return out;
 }
 
-export async function decryptBytes(key: CryptoKey, payload: Uint8Array): Promise<Uint8Array> {
+export async function decryptBytes(key: CryptoKey, payload: Uint8Array, aad?: Uint8Array): Promise<Uint8Array> {
   if (payload.length < 12 + 16) throw new Error('E2E payload too short');
   const iv = payload.slice(0, 12);
   const ct = payload.slice(12);
-  const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, ct);
+  const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv, additionalData: aad }, key, ct);
   return new Uint8Array(pt);
 }
 
@@ -156,6 +162,11 @@ export class E2eSession {
   private keyPair: CryptoKeyPair | null = null;
   private myPubB64: string = '';
   private sessionKey: CryptoKey | null = null;
+  // Replay protection: what WE send carries an outgoing sequence number;
+  // what WE receive (echoed input, e.g. terminal echo) is checked against a
+  // strict-increase window. Both reset per handshake (new key = new stream).
+  private sendSeq = 0;
+  private recvSeq = 0;
 
   constructor(e2eSecret: string) {
     this.e2eSecret = e2eSecret;
@@ -182,9 +193,35 @@ export class E2eSession {
     return true;
   }
 
-  async encrypt(plaintext: string): Promise<E2ePayload> {
+  /**
+   * Encrypt an INPUT payload with replay protection: the next sequence number
+   * is JSON-encoded and bound into the GCM AAD. The agent decrypts with the
+   * same AAD and rejects any payload whose seq is not strictly increasing, so
+   * a captured payload (e.g. a "y\n" confirmation) cannot be replayed later.
+   */
+  async encryptInput(plaintext: string): Promise<E2ePayload> {
     if (!this.sessionKey) throw new Error('E2E session not ready');
-    return encrypt(this.sessionKey, plaintext);
+    const seq = ++this.sendSeq;
+    const aad = new TextEncoder().encode(JSON.stringify({ v: 1, seq }));
+    const payload = await encrypt(this.sessionKey, plaintext, aad);
+    payload.seq = seq;
+    return payload;
+  }
+
+  /** Encrypt raw input bytes for a binary frame: returns
+   *  seq(4, big-endian) || iv(12) || ct||tag, with seq bound via GCM AAD. */
+  async encryptInputBytes(plaintext: Uint8Array): Promise<Uint8Array> {
+    if (!this.sessionKey) throw new Error('E2E session not ready');
+    const seq = ++this.sendSeq;
+    const aad = new TextEncoder().encode(JSON.stringify({ v: 1, seq }));
+    const body = await encryptBytes(this.sessionKey, plaintext, aad);
+    const out = new Uint8Array(4 + body.length);
+    out[0] = (seq >>> 24) & 0xff;
+    out[1] = (seq >>> 16) & 0xff;
+    out[2] = (seq >>> 8) & 0xff;
+    out[3] = seq & 0xff;
+    out.set(body, 4);
+    return out;
   }
 
   async decrypt(payload: E2ePayload): Promise<string> {
@@ -192,13 +229,24 @@ export class E2eSession {
     return decrypt(this.sessionKey, payload);
   }
 
-  /** Encrypt raw bytes for a binary frame: returns iv(12) || ct||tag. */
-  async encryptBytes(plaintext: Uint8Array): Promise<Uint8Array> {
+  /**
+   * Decrypt an INPUT payload and enforce replay protection: the seq in the
+   * payload must match the AAD the agent encrypted with (else GCM fails) and
+   * be strictly greater than the last accepted one (else it's a replay).
+   */
+  async decryptInput(payload: E2ePayload): Promise<string> {
     if (!this.sessionKey) throw new Error('E2E session not ready');
-    return encryptBytes(this.sessionKey, plaintext);
+    const seq = payload.seq;
+    if (typeof seq !== 'number' || !Number.isInteger(seq) || seq <= this.recvSeq) {
+      throw new Error('E2E input replay rejected');
+    }
+    const aad = new TextEncoder().encode(JSON.stringify({ v: 1, seq }));
+    const plaintext = await decrypt(this.sessionKey, payload, aad);
+    this.recvSeq = seq;
+    return plaintext;
   }
 
-  /** Decrypt a binary frame payload: input is iv(12) || ct||tag. */
+  /** Decrypt a binary-frame payload (output direction): iv(12) || ct||tag. */
   async decryptBytes(payload: Uint8Array): Promise<Uint8Array> {
     if (!this.sessionKey) throw new Error('E2E session not ready');
     return decryptBytes(this.sessionKey, payload);

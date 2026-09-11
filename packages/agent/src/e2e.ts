@@ -15,6 +15,8 @@ import {
 
 export interface E2ePayload {
   v: 1;
+  /** Input sequence number — bound into GCM AAD for replay protection. */
+  seq?: number;
   iv: string;   // base64, 12 bytes
   ct: string;   // base64, ciphertext || 16-byte GCM auth tag
 }
@@ -70,9 +72,10 @@ export function deriveSessionKey(
 
 // ── AES-256-GCM encrypt / decrypt ────────────────────────────────────────────
 
-export function encrypt(key: Buffer, plaintext: string): E2ePayload {
+export function encrypt(key: Buffer, plaintext: string, aad?: Buffer): E2ePayload {
   const iv = randomBytes(12);
   const cipher = createCipheriv('aes-256-gcm', key, iv);
+  if (aad) cipher.setAAD(aad);
   const ct = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()]);
   const tag = cipher.getAuthTag(); // 16 bytes
   // Concatenate ciphertext + tag (same layout as WebCrypto AES-GCM output)
@@ -80,13 +83,14 @@ export function encrypt(key: Buffer, plaintext: string): E2ePayload {
   return { v: 1, iv: iv.toString('base64'), ct: combined.toString('base64') };
 }
 
-export function decrypt(key: Buffer, payload: E2ePayload): string {
+export function decrypt(key: Buffer, payload: E2ePayload, aad?: Buffer): string {
   const iv = Buffer.from(payload.iv, 'base64');
   const combined = Buffer.from(payload.ct, 'base64');
   // Last 16 bytes = auth tag; rest = ciphertext
   const ct = combined.subarray(0, combined.length - 16);
   const tag = combined.subarray(combined.length - 16);
   const decipher = createDecipheriv('aes-256-gcm', key, iv);
+  if (aad) decipher.setAAD(aad);
   decipher.setAuthTag(tag);
   return Buffer.concat([decipher.update(ct), decipher.final()]).toString('utf8');
 }
@@ -96,20 +100,22 @@ export function decrypt(key: Buffer, payload: E2ePayload): string {
 // Same wire layout as E2ePayload but without base64: payload = iv(12) || ct||tag.
 // Used for terminal I/O binary frames where base64+JSON overhead is avoided.
 
-export function encryptBytes(key: Buffer, plaintext: Uint8Array): Uint8Array {
+export function encryptBytes(key: Buffer, plaintext: Uint8Array, aad?: Buffer): Uint8Array {
   const iv = randomBytes(12);
   const cipher = createCipheriv('aes-256-gcm', key, iv);
+  if (aad) cipher.setAAD(aad);
   const ct = Buffer.concat([cipher.update(plaintext), cipher.final()]);
   return Buffer.concat([iv, ct, cipher.getAuthTag()]);
 }
 
-export function decryptBytes(key: Buffer, payload: Uint8Array): Uint8Array {
+export function decryptBytes(key: Buffer, payload: Uint8Array, aad?: Buffer): Uint8Array {
   if (payload.length < 12 + 16) throw new Error('E2E payload too short');
   const iv = payload.subarray(0, 12);
   const combined = payload.subarray(12);
   const ct = combined.subarray(0, combined.length - 16);
   const tag = combined.subarray(combined.length - 16);
   const decipher = createDecipheriv('aes-256-gcm', key, iv);
+  if (aad) decipher.setAAD(aad);
   decipher.setAuthTag(tag);
   return Buffer.concat([decipher.update(ct), decipher.final()]);
 }
@@ -123,6 +129,10 @@ export class E2eSession {
   private e2eSecret: string; // hex
   private keyPair: AgentKeyPair | null = null;
   private sessionKey: Buffer | null = null;
+  // Replay protection (input direction): the client's sequence counter must
+  // strictly increase. A captured payload replayed by the relay fails here
+  // (and fails GCM anyway, since seq is bound into the AAD).
+  private recvSeq = 0;
 
   constructor(e2eSecret: string) {
     this.e2eSecret = e2eSecret;
@@ -148,18 +158,48 @@ export class E2eSession {
     return encrypt(this.sessionKey, plaintext);
   }
 
-  decrypt(payload: E2ePayload): string {
+  /**
+   * Decrypt an INPUT payload with replay protection: the payload's seq must
+   * match the AAD used at encryption (else GCM fails) and strictly exceed the
+   * last accepted seq (else it is a replay). Throws on any violation.
+   */
+  decryptInput(payload: E2ePayload): string {
     if (!this.sessionKey) throw new Error('E2E session not ready');
-    return decrypt(this.sessionKey, payload);
+    const seq = payload.seq;
+    if (typeof seq !== 'number' || !Number.isInteger(seq) || seq <= this.recvSeq) {
+      throw new Error('E2E input replay rejected');
+    }
+    const aad = Buffer.from(JSON.stringify({ v: 1, seq }), 'utf8');
+    const plaintext = decrypt(this.sessionKey, payload, aad);
+    this.recvSeq = seq;
+    return plaintext;
   }
 
-  /** Encrypt raw bytes for a binary frame: returns iv(12) || ct||tag. */
+  /**
+   * Decrypt raw INPUT bytes for a binary frame with replay protection.
+   * Wire layout: seq(4, big-endian) || iv(12) || ct||tag — the sender's
+   * counter travels in a fixed header and is bound into the GCM AAD, so a
+   * replayed frame both fails the counter check and (if seq were mutated to
+   * pass it) fails the GCM tag.
+   */
+  decryptInputBytes(payload: Uint8Array): Uint8Array {
+    if (!this.sessionKey) throw new Error('E2E session not ready');
+    if (payload.length < 4 + 12 + 16) throw new Error('E2E payload too short');
+    const seq = (payload[0] << 24 | payload[1] << 16 | payload[2] << 8 | payload[3]) >>> 0;
+    if (seq <= this.recvSeq) throw new Error('E2E input replay rejected');
+    const aad = Buffer.from(JSON.stringify({ v: 1, seq }), 'utf8');
+    const plaintext = decryptBytes(this.sessionKey, payload.subarray(4), aad);
+    this.recvSeq = seq;
+    return plaintext;
+  }
+
+  /** Encrypt raw bytes for a binary frame (output direction — no seq). */
   encryptBytes(plaintext: Uint8Array): Uint8Array {
     if (!this.sessionKey) throw new Error('E2E session not ready');
     return encryptBytes(this.sessionKey, plaintext);
   }
 
-  /** Decrypt a binary frame payload: input is iv(12) || ct||tag. */
+  /** Decrypt a binary frame payload (non-input): iv(12) || ct||tag. */
   decryptBytes(payload: Uint8Array): Uint8Array {
     if (!this.sessionKey) throw new Error('E2E session not ready');
     return decryptBytes(this.sessionKey, payload);

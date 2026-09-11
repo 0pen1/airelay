@@ -181,6 +181,8 @@ export class SessionManager {
       agentId: s.agentId,
       createdAt: s.createdAt,
     }));
-    writeFileSync(SESSIONS_FILE, JSON.stringify(data, null, 2));
+    // 0600: session ids are capability-ish (anyone who can reach tmux with
+    // them can attach); keep the metadata file private like config.json.
+    writeFileSync(SESSIONS_FILE, JSON.stringify(data, null, 2), { mode: 0o600 });
   }
 }

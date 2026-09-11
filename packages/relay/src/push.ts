@@ -33,7 +33,9 @@ function ensureKeys(): { publicKey: string; privateKey: string } {
   }
   vapidKeys = webpush.generateVAPIDKeys();
   mkdirSync(dirname(p), { recursive: true });
-  writeFileSync(p, JSON.stringify(vapidKeys, null, 2));
+  // 0600: the VAPID private key is the relay's push identity — treat like a
+  // credential (same directory also holds relay.db with host secrets).
+  writeFileSync(p, JSON.stringify(vapidKeys, null, 2), { mode: 0o600 });
   return vapidKeys;
 }
 

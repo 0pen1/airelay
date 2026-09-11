@@ -32,6 +32,19 @@ function relativeTime(ts: number): string {
   return `${Math.floor(diff / 86400)}d ago`;
 }
 
+/** Escape for innerHTML interpolation. Session/agent metadata (icon, name)
+ *  crosses the untrusted relay, which can forge any of these fields — they
+ *  must never reach the DOM raw (XSS would expose every host's session
+ *  token and e2e_secret in localStorage). */
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
 export function mountSessions(app: HTMLElement): () => void {
   let sessions: SessionInfo[] = [];
   let agentTypes: AgentTypeInfo[] = [];
@@ -268,10 +281,10 @@ export function mountSessions(app: HTMLElement): () => void {
       card.setAttribute('tabindex', occupied ? '-1' : '0');
       if (occupied) card.setAttribute('aria-disabled', 'true');
       card.innerHTML = `
-        <span class="session-icon" aria-hidden="true">${s.icon}</span>
+        <span class="session-icon" aria-hidden="true">${escapeHtml(s.icon)}</span>
         <div class="session-info">
-          <div class="session-name">${s.agent_name}</div>
-          <div class="session-meta">${relativeTime(s.created_at)}</div>
+          <div class="session-name">${escapeHtml(s.agent_name)}</div>
+          <div class="session-meta">${escapeHtml(relativeTime(s.created_at))}</div>
         </div>
         ${st?.running ? '<span class="session-running" title="Working…" aria-label="Running"></span>' : ''}
         ${st?.has_unread && !occupied ? '<span class="session-unread" aria-label="New output"></span>' : ''}
@@ -320,8 +333,8 @@ export function mountSessions(app: HTMLElement): () => void {
       btn.disabled = !a.available;
       btn.setAttribute('role', 'listitem');
       btn.innerHTML = `
-        <span class="agent-btn-icon" aria-hidden="true">${a.icon}</span>
-        <span class="agent-btn-name">${a.name}</span>
+        <span class="agent-btn-icon" aria-hidden="true">${escapeHtml(a.icon)}</span>
+        <span class="agent-btn-name">${escapeHtml(a.name)}</span>
         ${!a.available ? '<span class="agent-btn-unavail">Not installed</span>' : ''}
       `;
       if (a.available) {
