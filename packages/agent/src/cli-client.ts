@@ -25,7 +25,10 @@ interface Config {
 }
 
 export function loadConfig(): Config {
-  return JSON.parse(readFileSync(join(homedir(), '.config', 'airelay', 'config.json'), 'utf8')) as Config;
+  // Honor AIRELAY_CONFIG_DIR like daemon.ts — without this the CLI always
+  // read the production config, even for test/CI environments.
+  const dir = process.env.AIRELAY_CONFIG_DIR ?? join(homedir(), '.config', 'airelay');
+  return JSON.parse(readFileSync(join(dir, 'config.json'), 'utf8')) as Config;
 }
 
 export interface SessionListItem {
@@ -41,6 +44,9 @@ export interface SessionListItem {
 export class CliClient {
   private ws!: WebSocket;
   private e2eKey: Buffer | null = null;
+  // Outgoing input sequence counter — bound into the GCM AAD like the web
+  // client's, so the agent's strictly-increasing replay check accepts it.
+  private inputSeq = 0;
   private ecdh = createECDH('prime256v1');
   private slots = new Map<number, string>(); // slot → session_id
   private slotsBySession = new Map<string, number>();
@@ -148,12 +154,31 @@ export class CliClient {
     return Buffer.concat([d.update(rest.subarray(0, rest.length - 16)), d.final()]);
   }
 
-  private encryptBytes(plaintext: Uint8Array): Buffer {
+  /** Encrypt INPUT bytes for a binary frame with replay protection:
+   *  seq(4, big-endian) || iv(12) || ct||tag, seq bound via GCM AAD —
+   *  mirrors web E2eSession.encryptInputBytes / agent decryptInputBytes. */
+  private encryptInputBytes(plaintext: Uint8Array): Buffer {
     const key = this.e2eKey;
     if (!key) return Buffer.from(plaintext);
+    const seq = ++this.inputSeq;
     const iv = randomBytes(12);
     const c = createCipheriv('aes-256-gcm', key, iv);
-    return Buffer.concat([iv, c.update(plaintext), c.final(), c.getAuthTag()]);
+    c.setAAD(Buffer.from(JSON.stringify({ v: 1, seq }), 'utf8'));
+    const body = Buffer.concat([iv, c.update(plaintext), c.final(), c.getAuthTag()]);
+    const head = Buffer.alloc(4);
+    head.writeUInt32BE(seq >>> 0);
+    return Buffer.concat([head, body]);
+  }
+
+  /** Encrypt an INPUT payload for the JSON path with replay protection:
+   *  { v:1, seq, iv, ct } with seq bound via AAD — mirrors encryptInput. */
+  private encryptInput(plaintext: string): { v: 1; seq: number; iv: string; ct: string } {
+    const seq = ++this.inputSeq;
+    const iv = randomBytes(12);
+    const c = createCipheriv('aes-256-gcm', this.e2eKey!, iv);
+    c.setAAD(Buffer.from(JSON.stringify({ v: 1, seq }), 'utf8'));
+    const ct = Buffer.concat([c.update(Buffer.from(plaintext, 'utf8')), c.final(), c.getAuthTag()]);
+    return { v: 1, seq, iv: iv.toString('base64'), ct: ct.toString('base64') };
   }
 
   private dispatch(msg: Record<string, unknown>): void {
@@ -210,15 +235,13 @@ export class CliClient {
   sendInput(sessionId: string, data: string): void {
     const slot = this.slotsBySession.get(sessionId);
     if (slot !== undefined) {
-      this.ws.send(encodeBinaryFrame(BinaryOpcode.INPUT, slot, this.encryptBytes(Buffer.from(data, 'utf8'))));
+      this.ws.send(encodeBinaryFrame(BinaryOpcode.INPUT, slot, this.encryptInputBytes(Buffer.from(data, 'utf8'))));
     } else {
-      const msg: Record<string, unknown> = { type: 'input', session_id: sessionId, data };
+      const msg: Record<string, unknown> = { type: 'input', session_id: sessionId };
       if (this.e2eKey) {
-        const iv = randomBytes(12);
-        const c = createCipheriv('aes-256-gcm', this.e2eKey, iv);
-        const ct = Buffer.concat([c.update(Buffer.from(data, 'utf8')), c.final(), c.getAuthTag()]);
-        msg['e2e'] = { v: 1, iv: iv.toString('base64'), ct: ct.toString('base64') };
-        delete msg['data'];
+        msg['e2e'] = this.encryptInput(data);
+      } else {
+        msg['data'] = data;
       }
       this.sendJson(msg);
     }

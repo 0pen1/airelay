@@ -8,7 +8,10 @@ import type { AgentDriver } from './drivers/types.js';
 import type { PtyDriverConfig, AgentDriverConfig } from '@airelay/shared';
 
 const execFile = promisify(execFileCb);
-const CONFIG_DIR = join(homedir(), '.config', 'airelay');
+// Honor AIRELAY_CONFIG_DIR like daemon.ts/index.ts — hardcoding homedir()
+// here made test/CI agents write session metadata into the real user's
+// sessions.json (found during E2E testing).
+const CONFIG_DIR = process.env.AIRELAY_CONFIG_DIR ?? join(homedir(), '.config', 'airelay');
 const SESSIONS_FILE = join(CONFIG_DIR, 'sessions.json');
 
 export interface SessionEntry {
